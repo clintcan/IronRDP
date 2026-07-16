@@ -220,7 +220,7 @@ impl UsbDeviceCaps {
         device_speed: DeviceSpeed,
     ) -> Result<(), &'static str> {
         if usb_bus_iface_ver.to_u32() == UsbBusIfaceVer::V0.to_u32()
-            && device_speed.to_u32() == DeviceSpeed::HIGH_SPEED.to_u32()
+            && device_speed.to_u32() != DeviceSpeed::FULL_SPEED.to_u32()
         {
             Err("must be 0x00000000 when UsbBusInterfaceVersion is 0x00000000")
         } else {

@@ -58,3 +58,41 @@ fn usb3_capabilities_decode_from_raw_bytes() {
     assert_eq!(decoded.usbdi_ver, UsbdiVer::V0X600);
     assert_eq!(decoded.device_speed, DeviceSpeed::HIGH_SPEED);
 }
+
+/// [MS-RDPEUSB] 2.2.11: when `UsbBusInterfaceVersion` is `0x00000000`,
+/// `DeviceIsHighSpeed` MUST be `0x00000000`. Because `DeviceSpeed` is now a
+/// lenient newtype that preserves any device-reported value, the constraint has
+/// to reject *any* non-zero speed at bus-interface version 0 — not only the
+/// named `HIGH_SPEED` (`1`); a `device_speed` of `2` at version 0 is equally
+/// invalid. The constraint does not apply once the bus-interface version is
+/// non-zero.
+#[rstest]
+#[case(0x0, 0x0, true)] // V0 + FullSpeed: well-formed
+#[case(0x0, 0x1, false)] // V0 + HighSpeed: rejected
+#[case(0x0, 0x2, false)] // V0 + unnamed non-zero speed: rejected (missed by the old `== HIGH_SPEED` check)
+#[case(0x2, 0x1, true)] // V2 + HighSpeed: constraint does not apply
+fn device_speed_must_be_zero_at_bus_iface_version_0(
+    #[case] bus_iface_ver: u32,
+    #[case] device_speed: u32,
+    #[case] should_decode: bool,
+) {
+    #[rustfmt::skip]
+    let mut raw: [u8; 28] = [
+        0x1c, 0x00, 0x00, 0x00, // CbSize = 28
+        0x00, 0x00, 0x00, 0x00, // UsbBusInterfaceVersion (patched below, offset 4)
+        0x00, 0x06, 0x00, 0x00, // USBDI_Version = 0x600
+        0x00, 0x02, 0x00, 0x00, // Supported_USB_Version = 0x200
+        0x00, 0x00, 0x00, 0x00, // HcdCapabilities = 0
+        0x00, 0x00, 0x00, 0x00, // DeviceIsHighSpeed (patched below, offset 20)
+        0x00, 0x00, 0x00, 0x00, // NoAckIsochWriteJitterBufferSizeInMs = 0
+    ];
+    raw[4..8].copy_from_slice(&bus_iface_ver.to_le_bytes());
+    raw[20..24].copy_from_slice(&device_speed.to_le_bytes());
+
+    let result: Result<UsbDeviceCaps, _> = decode(&raw);
+    assert_eq!(
+        result.is_ok(),
+        should_decode,
+        "bus_iface_ver={bus_iface_ver:#x} device_speed={device_speed:#x}"
+    );
+}
