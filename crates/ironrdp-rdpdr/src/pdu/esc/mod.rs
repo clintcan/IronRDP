@@ -4,6 +4,7 @@
 
 pub mod ndr;
 pub mod rpce;
+mod server_direction; // (macrdp divergence 2) encode `*Call`, decode `*Return`
 
 use bitflags::bitflags;
 use ironrdp_core::{
