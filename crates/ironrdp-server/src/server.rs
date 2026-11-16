@@ -101,6 +101,12 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The clock lives here, in the I/O driver, rather than inside [`AutoDetectManager`]:
 /// the state machine takes timestamps as arguments so it stays free of ambient time.
 /// Only differences are meaningful, so the epoch is arbitrary.
+// (macrdp divergence 12) macrdp's UDP multitransport, as a child module so it can
+// extend `RdpServer`; this file only carries the hook calls.
+#[cfg(feature = "multitransport")]
+#[path = "mt/session.rs"]
+mod mt_session;
+
 fn monotonic_now_ms() -> u64 {
     static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
     u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -873,6 +879,9 @@ struct MacrdpServerState {
     channels: MacrdpChannelFactories,
     /// (2/8) Dedicated audio channel; drained by `dispatch_audio` in `client_loop`.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>>,
+    /// (12) macrdp's UDP multitransport.
+    #[cfg(feature = "multitransport")]
+    mt: mt_session::MtState,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -2090,6 +2099,8 @@ impl RdpServer {
             dvc
         };
 
+        #[cfg(feature = "multitransport")]
+        let dvc = self.mt_attach_audio_dvcs(dvc);
         acceptor.attach_static_channel(dvc);
 
         for factory in &self.static_channel_factories {
@@ -2335,6 +2346,9 @@ impl RdpServer {
             self.opts.honor_client_desktop_size,
             self.opts.udp_bind_addr,
         );
+
+        #[cfg(feature = "multitransport")]
+        self.mt_offer(pending.acceptor_mut());
 
         self.attach_channels(pending.acceptor_mut(), monitor_count);
 
@@ -2808,6 +2822,8 @@ impl RdpServer {
             // takeover.
             self.static_channels = StaticChannelSet::new();
             self.connection_local_addr = None;
+            #[cfg(feature = "multitransport")]
+            self.mt_teardown();
 
             if let Some(action) = with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_disconnected(peer, duration, result.as_ref().err())
@@ -3475,8 +3491,16 @@ impl RdpServer {
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
                     EgfxServerMessage::SendMessages { messages } => {
+                        // (macrdp divergence 12) Once EGFX has migrated, it rides
+                        // macrdp's tunnel instead of TCP.
+                        #[cfg(feature = "multitransport")]
+                        let Some(messages) = self.mt_route_egfx(messages)? else {
+                            continue;
+                        };
                         self.dispatch_egfx_messages(messages, writer, user_channel_id, udp_transport)
                             .await?;
+                        #[cfg(feature = "multitransport")]
+                        self.mt_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
@@ -3828,6 +3852,8 @@ impl RdpServer {
         let mut udp_tunnel_writer = writer.clone();
         let mut audio_writer = writer.clone();
         let audio_receiver = self.macrdp.audio_receiver.clone();
+        #[cfg(feature = "multitransport")]
+        let tunnel_inbound = self.mt_take_tunnel_inbound();
         let udp_transport_for_events = Rc::clone(&udp_transport);
         let udp_transport_for_pdus = Rc::clone(&udp_transport);
         let write_counter = writer.write_counter();
@@ -4141,6 +4167,14 @@ impl RdpServer {
 
                 let encoded = {
                     let mut this = this.lock().await;
+                    // (macrdp divergence 12) The lossy tunnel takes the wave once that
+                    // path is live; static RDPSND stays silent then (no double play).
+                    #[cfg(feature = "multitransport")]
+                    let Some(data) = this.mt_route_lossy_audio(data, ts) else {
+                        drop(this);
+                        lag.shipped(wave_ms);
+                        continue;
+                    };
                     let Some(rdpsnd) = this.get_svc_processor::<RdpsndServer>() else {
                         warn!("No rdpsnd channel, dropping wave");
                         continue;
@@ -4173,6 +4207,20 @@ impl RdpServer {
             }
         };
 
+        // (macrdp divergence 12) Client-to-server data from macrdp's tunnel (e.g. EGFX
+        // frame acks once EGFX migrated). Idle when there's no tunnel.
+        let this = Rc::clone(&s);
+        let dispatch_mt_tunnel = async move {
+            let _ = &this;
+            #[cfg(feature = "multitransport")]
+            if let Some(mut rx) = tunnel_inbound {
+                while let Some(pdu) = rx.recv().await {
+                    this.lock().await.mt_process_tunnel_inbound(&pdu);
+                }
+            }
+            core::future::pending::<ServerResult<RunState>>().await
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
@@ -4181,6 +4229,7 @@ impl RdpServer {
             state = send_heartbeats => state,
             state = dispatch_udp_tunnel => state,
             state = dispatch_audio => state,
+            state = dispatch_mt_tunnel => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -4662,6 +4711,8 @@ impl RdpServer {
                     self.udp_migration_allowed = true;
                     debug!("Multitransport confirmed after finalization, EGFX may migrate to UDP");
                 }
+                #[cfg(feature = "multitransport")]
+                self.mt_on_response(&pdu);
             }
             Err(error) => {
                 warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
@@ -4693,6 +4744,8 @@ impl RdpServer {
 
                 if message_channel_id == Some(data.channel_id) {
                     self.handle_message_channel_data(data);
+                    #[cfg(feature = "multitransport")]
+                    self.mt_send_owed_soft_sync(writer, user_channel_id).await?;
                     return Ok(false);
                 }
 
@@ -4856,6 +4909,9 @@ impl RdpServer {
                     ));
                 }
             };
+
+            #[cfg(feature = "multitransport")]
+            self.mt_on_finalized(&acceptor, result.reactivation);
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 

@@ -28,6 +28,9 @@ usb = ["dep:ironrdp-rdpeusb", "dep:ironrdp-usb"]
 # bitmap codec fallback (e.g., RemoteFX-only or H.264-capable clients) don't
 # pay the extra build cost.
 nscodec = ["dep:ironrdp-nscodec"]
+# (macrdp) macrdp's own RDP UDP multitransport (src/mt/): RDPEUDP + DTLS lossy flow +
+# Soft-Sync, independent of upstream's `with_udp_transport` path. Off by default.
+multitransport = ["dep:macrdp-rdpeudp", "dep:getrandom", "dep:boring"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.
@@ -35,7 +38,7 @@ __bench = ["dep:visibility"]
 
 [dependencies]
 rand = "0.9"
-anyhow = "1.0" # (macrdp) error type of macrdp's own channel modules (rdpdr_drive)
+anyhow = "1.0" # (macrdp) error type of macrdp's own channel modules (rdpdr_drive, mt)
 tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] }
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
@@ -72,6 +75,16 @@ bytes = "1"
 visibility = { version = "0.1", optional = true }
 qoicoubeh = { version = "0.5", optional = true }
 zstd-safe = { version = "7.2", optional = true }
+# (macrdp, `multitransport`) macrdp's own sans-I/O RDPEUDP wire codecs + reliability
+# state machine (vendor/macrdp-rdpeudp in clintcan/macrdp; unrelated to upstream's
+# ironrdp-rdpeudp). macrdp patches this to its own path.
+macrdp-rdpeudp = { git = "https://github.com/clintcan/macrdp", rev = "69fb62da05c8e77663c8ae91742c8cb7e73ca955", optional = true }
+getrandom = { version = "0.2", optional = true } # (macrdp, `multitransport`) offer cookie
+# (macrdp, `multitransport`) DTLS 1.2 server for the lossy (`UdpFecL`) flow, sans-I/O
+# over boring's custom-BIO `SslStream`. BoringSSL is vendored and built from source
+# (needs cmake + Go + libclang at build time; GitHub-hosted runners ship all three).
+# Coexists with rustls's aws-lc-rs/ring via symbol prefixing.
+boring = { version = "4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync"] }
