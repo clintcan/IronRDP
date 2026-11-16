@@ -210,6 +210,15 @@ pub trait ConnectionHandler: Send {
     fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
         let _ = (success, reason);
     }
+
+    /// (macrdp divergence 20) Called once per connection when the capability
+    /// exchange completes (not on a deactivation–reactivation), carrying the
+    /// client-fingerprint identity: the GCC Client Core Data hostname / raw RDP
+    /// version / build number plus the General-capset platform (formatted).
+    /// Informational fingerprinting: a client can claim anything. Default: no-op.
+    fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
+        let _ = (client_name, rdp_version, client_build, platform);
+    }
 }
 
 /// Outcome of a successful [`CredentialValidator::validate`] call.
@@ -4474,6 +4483,41 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        // (macrdp divergence 20) Client-fingerprint log: the identity the acceptor
+        // captured from the GCC Client Core Data (acceptor divergence 4) plus the
+        // General-capset platform. mstsc sends the real Windows build + WINDOWS;
+        // FreeRDP hardcodes build 2600; the Windows Apps announce their host platform.
+        // Informational only: a client can claim anything. Before the auto-reconnect
+        // and credential checks, so a denied attempt is still fingerprinted; skipped
+        // on reactivation (same connection, already logged).
+        if !result.reactivation {
+            let platform = result
+                .capabilities
+                .iter()
+                .find_map(|c| match c {
+                    CapabilitySet::General(g) => {
+                        Some(format!("{:?}/{:?}", g.major_platform_type, g.minor_platform_type))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+            info!(
+                client_name = %result.client_name,
+                rdp_version = format_args!("{:#x}", result.client_version),
+                client_build = result.client_build,
+                platform = %platform,
+                "client fingerprint"
+            );
+            with_connection_handler(self.connection_handler.as_ref(), |h| {
+                h.on_client_fingerprint(
+                    &result.client_name,
+                    result.client_version,
+                    result.client_build,
+                    &platform,
+                );
+            });
+        }
 
         let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
             if !self.verify_auto_reconnect_cookie(reconnect) {
