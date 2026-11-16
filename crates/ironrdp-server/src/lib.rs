@@ -8,6 +8,7 @@ mod macros;
 // equivalents (which stay inert: macrdp never sets their factories). See CLAUDE.md.
 #[cfg(feature = "multitransport")]
 mod mt;
+mod rdcamera;
 mod rdpdr_drive;
 mod rdpeusb;
 
@@ -57,6 +58,10 @@ pub use mt::dtls::DtlsServerContext;
 pub use mt::listener::{ListenerConfig, UdpMultitransportListener};
 #[cfg(feature = "multitransport")]
 pub use mt::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};
+pub use rdcamera::{
+    CameraSampleSink, CameraServerMessage, RDCAMERA_CHANNEL_NAME, RdCameraDeviceProcessor, RdCameraServer,
+    RdCameraServerFactory,
+};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
 pub use rdpdr_drive::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory,
