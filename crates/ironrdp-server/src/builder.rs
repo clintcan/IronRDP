@@ -299,6 +299,14 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// (macrdp divergence 25) Configure macrdp's MS-RDPEAI audio-input (microphone)
+    /// channel. Don't combine with [`Self::with_rdpeai_factory`]: both register
+    /// `AUDIO_INPUT`.
+    pub fn with_audin_factory(mut self, factory: Option<Box<dyn crate::AudinServerFactory>>) -> Self {
+        self.state.macrdp_channels.audin = factory;
+        self
+    }
+
     pub fn with_bitmap_codecs(mut self, codecs: BitmapCodecs) -> Self {
         self.state.codecs = codecs;
         self
