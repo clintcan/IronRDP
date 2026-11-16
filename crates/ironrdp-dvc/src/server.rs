@@ -353,6 +353,57 @@ impl DrdynvcServer {
         Ok(message)
     }
 
+    // (macrdp divergence) See vendor/ironrdp-dvc/CLAUDE.md.
+    /// Creates a Soft-Sync request that moves the supplied channels onto `tunnel_type`,
+    /// leaving per-channel routing to the caller.
+    ///
+    /// Like [`Self::request_reliable_udp`], a connection gets one request, and the
+    /// client's response is validated against it (only `tunnel_type` may be selected).
+    /// Two differences:
+    ///
+    /// - `tunnel_type` may be [`SoftSyncTunnelType::LOSSY_UDP`], and `channel_ids` may be
+    ///   empty: the request then carries no channel list (only SOFT_SYNC_TCP_FLUSHED is
+    ///   set), confirming the tunnel without moving any channel.
+    /// - The channels are **not** registered for tunneling: [`Self::tunnel_for_outgoing_channel`]
+    ///   stays `None` for them, and [`SvcProcessor::process`] keeps accepting their data
+    ///   over TCP. The caller routes their data itself, which lets it move a channel back to
+    ///   TCP when the tunnel fails, something the Soft-Sync protocol has no message for.
+    pub fn request_soft_sync(
+        &mut self,
+        tunnel_type: SoftSyncTunnelType,
+        channel_ids: Vec<u32>,
+    ) -> PduResult<SvcMessage> {
+        if !matches!(self.soft_sync_state, SoftSyncState::Idle) {
+            return Err(pdu_other_err!("soft-sync has already been requested"));
+        }
+
+        let mut seen = BTreeSet::new();
+        for channel_id in &channel_ids {
+            if !self.is_channel_opened(*channel_id) {
+                return Err(pdu_other_err!(
+                    "Soft-Sync requested for a dynamic channel that is not open"
+                ));
+            }
+            if !seen.insert(*channel_id) {
+                return Err(pdu_other_err!("soft-sync channel list contains a duplicate channel ID"));
+            }
+        }
+
+        let channel_lists = if channel_ids.is_empty() {
+            Vec::new()
+        } else {
+            alloc::vec![SoftSyncChannelList::new(tunnel_type, channel_ids)]
+        };
+        let message = as_svc_msg_with_flag(DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
+            channel_lists,
+        )))?;
+        self.soft_sync_state = SoftSyncState::Active {
+            requested_tunnels: BTreeSet::from([tunnel_type]),
+            response_received: false,
+        };
+        Ok(message)
+    }
+
     /// Returns whether server-to-client data for `channel_id` must be sent through a tunnel.
     pub fn tunnel_for_outgoing_channel(&self, channel_id: u32) -> Option<SoftSyncTunnelType> {
         self.outgoing_tunnel_channels.get(&channel_id).copied()
@@ -645,5 +696,123 @@ mod tests {
 
         assert!(server.soft_sync_response_received());
         assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    // (macrdp divergence) Tests for `request_soft_sync`.
+
+    fn soft_sync_response(tunnels: Vec<SoftSyncTunnelType>) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::SoftSyncResponse(
+            crate::pdu::SoftSyncResponsePdu::new(tunnels),
+        ))
+        .unwrap()
+    }
+
+    fn data_for(channel_id: u32) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, Vec::new()),
+        )))
+        .unwrap()
+    }
+
+    fn expected_request(channel_lists: Vec<SoftSyncChannelList>) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
+            channel_lists,
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn request_soft_sync_validates_the_response_but_leaves_routing_to_the_caller() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        let request = server
+            .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert_eq!(
+            request.encode_unframed_pdu().unwrap(),
+            expected_request(alloc::vec![SoftSyncChannelList::new(
+                SoftSyncTunnelType::LOSSY_UDP,
+                alloc::vec![channel_id],
+            )])
+        );
+        assert_eq!(server.tunnel_for_outgoing_channel(channel_id), None);
+
+        server
+            .process(&soft_sync_response(alloc::vec![SoftSyncTunnelType::LOSSY_UDP]))
+            .unwrap();
+        assert!(server.soft_sync_response_received());
+
+        // The caller owns routing, so the channel's data is still accepted over TCP —
+        // what lets a caller move a channel back to TCP when its tunnel fails.
+        assert!(server.process(&data_for(channel_id)).is_ok());
+    }
+
+    #[test]
+    fn request_soft_sync_without_channels_sends_no_channel_list() {
+        let mut server = DrdynvcServer::new();
+
+        let request = server
+            .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, Vec::new())
+            .unwrap();
+        assert_eq!(request.encode_unframed_pdu().unwrap(), expected_request(Vec::new()));
+
+        server.process(&soft_sync_response(Vec::new())).unwrap();
+        assert!(server.soft_sync_response_received());
+    }
+
+    #[test]
+    fn request_soft_sync_rejects_a_response_selecting_an_unrequested_tunnel() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server
+            .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert!(
+            server
+                .process(&soft_sync_response(alloc::vec![SoftSyncTunnelType::RELIABLE_UDP]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn request_soft_sync_allows_one_request_per_connection() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server
+            .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+                .is_err()
+        );
+        assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    #[test]
+    fn request_soft_sync_rejects_unopened_and_duplicate_channels() {
+        let mut server = DrdynvcServer::new();
+        let opened = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let pending = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Creation);
+
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![pending])
+                .is_err()
+        );
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![opened, opened])
+                .is_err()
+        );
+        // A rejected request leaves the one-request allowance unused.
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![opened])
+                .is_ok()
+        );
     }
 }
