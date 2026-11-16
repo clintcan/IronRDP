@@ -200,6 +200,16 @@ pub trait ConnectionHandler: Send {
         let _ = (peer, duration, error);
         PostConnectionAction::Continue
     }
+
+    /// (macrdp divergence 18) Called once per connection after the CredSSP/NLA
+    /// exchange resolves (only under Hybrid security), including for a preemption
+    /// candidate. `success` is whether the client's credentials validated; `reason`
+    /// is a short error description when they did not (auth did not complete:
+    /// dominated by bad credentials, but also a client abort or a mid-exchange
+    /// transport error). Default: no-op.
+    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        let _ = (success, reason);
+    }
 }
 
 /// Outcome of a successful [`CredentialValidator::validate`] call.
@@ -1092,6 +1102,8 @@ enum NegotiatedTransport<S> {
 struct PendingConnection {
     security: RdpServerSecurity,
     acceptor: Acceptor,
+    /// (macrdp divergence 18) Told the CredSSP outcome; see [`Self::observe_authentication`].
+    auth_observer: Option<SharedConnectionHandler>,
 }
 
 impl PendingConnection {
@@ -1119,7 +1131,18 @@ impl PendingConnection {
                     | ironrdp_pdu::gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
             ));
         }
-        Self { security, acceptor }
+        Self {
+            security,
+            acceptor,
+            auth_observer: None,
+        }
+    }
+
+    /// (macrdp divergence 18) Report this connection's CredSSP outcome to `handler`'s
+    /// [`ConnectionHandler::on_authenticated`], including for a preemption candidate.
+    fn observe_authentication(mut self, handler: Option<SharedConnectionHandler>) -> Self {
+        self.auth_observer = handler;
+        self
     }
 
     /// Mutable access to the acceptor for the one thing that must happen
@@ -1150,7 +1173,11 @@ impl PendingConnection {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        let PendingConnection { security, mut acceptor } = self;
+        let PendingConnection {
+            security,
+            mut acceptor,
+            auth_observer,
+        } = self;
         let security = &security;
         let framed = TokioFramed::new(stream);
 
@@ -1181,7 +1208,7 @@ impl PendingConnection {
                         }
                     };
                     let mut framed = TokioFramed::new(accept);
-                    complete_security_upgrade(security, &mut framed, &mut acceptor).await?;
+                    complete_security_upgrade(security, &mut framed, &mut acceptor, auth_observer.as_ref()).await?;
                     Ok(Some(NegotiatedConnection {
                         transport: NegotiatedTransport::Tls(Box::new(framed)),
                         acceptor,
@@ -1194,7 +1221,7 @@ impl PendingConnection {
                 // tls_acceptor.accept on it.
                 TransportTls::AlreadyDone => {
                     let mut framed = TokioFramed::new(stream);
-                    complete_security_upgrade(security, &mut framed, &mut acceptor).await?;
+                    complete_security_upgrade(security, &mut framed, &mut acceptor, auth_observer.as_ref()).await?;
                     Ok(Some(NegotiatedConnection {
                         transport: NegotiatedTransport::Offloaded(framed),
                         acceptor,
@@ -1246,6 +1273,7 @@ async fn complete_security_upgrade<S>(
     security: &RdpServerSecurity,
     framed: &mut TokioFramed<S>,
     acceptor: &mut Acceptor,
+    auth_observer: Option<&SharedConnectionHandler>,
 ) -> ServerResult<()>
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
@@ -1258,7 +1286,7 @@ where
         // uses this value in practice.
         let client_name = "rdp-client".to_owned();
 
-        ironrdp_acceptor::accept_credssp(
+        let result = ironrdp_acceptor::accept_credssp(
             framed,
             acceptor,
             &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
@@ -1266,8 +1294,14 @@ where
             pub_key.clone(),
             None,
         )
-        .await
-        .map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+        .await;
+        // (macrdp divergence 18) After `mark_security_upgrade_as_done`, so a pre-TLS
+        // negotiation blip can't report a failed login.
+        with_connection_handler(auth_observer, |h| {
+            let reason = result.as_ref().err().map(ToString::to_string);
+            h.on_authenticated(result.is_ok(), reason.as_deref());
+        });
+        result.map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
     }
 
     Ok(())
@@ -1410,6 +1444,8 @@ struct NegotiationContext {
     opts: RdpServerOptions,
     creds: Option<Credentials>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    /// (macrdp divergence 18) So a candidate's CredSSP outcome is audited too.
+    connection_handler: Option<SharedConnectionHandler>,
 }
 
 /// A candidate that has negotiated AND authenticated, and so has earned the
@@ -1444,7 +1480,8 @@ async fn negotiate_candidate(
         ctx.creds.clone(),
         ctx.opts.honor_client_desktop_size,
         ctx.opts.udp_bind_addr,
-    );
+    )
+    .observe_authentication(ctx.connection_handler.clone());
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
     // sound / gfx backends means running user-supplied factories for a peer
@@ -2260,6 +2297,7 @@ impl RdpServer {
             opts: self.opts.clone(),
             creds: self.creds.clone(),
             display: Arc::clone(&self.display),
+            connection_handler: self.connection_handler.clone(),
         }
     }
 
@@ -2418,7 +2456,8 @@ impl RdpServer {
             self.creds.clone(),
             self.opts.honor_client_desktop_size,
             self.opts.udp_bind_addr,
-        );
+        )
+        .observe_authentication(self.connection_handler.clone());
 
         #[cfg(feature = "multitransport")]
         self.mt_offer(pending.acceptor_mut());
@@ -5482,6 +5521,7 @@ mod preempt_tests {
             },
             creds: None,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
+            connection_handler: None,
         }
     }
 
