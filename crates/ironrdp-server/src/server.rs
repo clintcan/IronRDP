@@ -879,6 +879,8 @@ struct MacrdpServerState {
     channels: MacrdpChannelFactories,
     /// (2/8) Dedicated audio channel; drained by `dispatch_audio` in `client_loop`.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>>,
+    /// (15) Kernel TCP RTT sampled at accept, in ms (0 = unknown).
+    link_rtt_ms: Option<Arc<AtomicU32>>,
     /// (12) macrdp's UDP multitransport.
     #[cfg(feature = "multitransport")]
     mt: mt_session::MtState,
@@ -1180,6 +1182,7 @@ impl PendingConnection {
                         transport: NegotiatedTransport::Tls(Box::new(framed)),
                         acceptor,
                         local_addr: None,
+                        link_rtt_ms: None,
                     }))
                 }
                 // The stream is already past TLS (terminated at a lower
@@ -1192,6 +1195,7 @@ impl PendingConnection {
                         transport: NegotiatedTransport::Offloaded(framed),
                         acceptor,
                         local_addr: None,
+                        link_rtt_ms: None,
                     }))
                 }
             },
@@ -1200,6 +1204,7 @@ impl PendingConnection {
                 transport: NegotiatedTransport::Continued(framed),
                 acceptor,
                 local_addr: None,
+                link_rtt_ms: None,
             })),
         }
     }
@@ -1215,6 +1220,9 @@ struct NegotiatedConnection<S> {
     /// The local address the client reached, when the stream is a socket
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
+    /// (macrdp divergence 15) The accept-time TCP RTT of a preemption candidate,
+    /// sampled while its raw socket was still reachable.
+    link_rtt_ms: Option<u32>,
 }
 
 /// Advance a stream that is now past the security upgrade: mark the acceptor
@@ -1445,10 +1453,12 @@ async fn negotiate_candidate(
     // happens there, not in `accept_begin`.
 
     let local_addr = stream.local_addr().ok();
+    let link_rtt_ms = tcp_srtt_ms(&stream);
     match pending.negotiate_and_authenticate(stream, TransportTls::Managed).await {
         Ok(Some(mut negotiated)) => {
             debug!(?peer, "candidate authenticated -- eligible to preempt the live session");
             negotiated.local_addr = local_addr;
+            negotiated.link_rtt_ms = link_rtt_ms;
             Some((Box::new(negotiated), peer))
         }
         Ok(None) => {
@@ -1493,6 +1503,37 @@ async fn negotiate_candidate_bounded(
             None
         }
     }
+}
+
+/// (macrdp divergence 15) The kernel's smoothed TCP RTT for an accepted connection, in
+/// ms, via `getsockopt(TCP_CONNECTION_INFO)` (macOS). The kernel seeds srtt from the
+/// SYN/SYN-ACK exchange, so a value exists right at accept. `None` on error or on
+/// platforms without the option; a sub-ms LAN RTT maps to 1, keeping 0 for "unknown".
+#[cfg(target_os = "macos")]
+fn tcp_srtt_ms(stream: &TcpStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    // SAFETY: `tcp_connection_info` is a plain C struct, valid when zeroed.
+    let mut info: libc::tcp_connection_info = unsafe { core::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(size_of::<libc::tcp_connection_info>()).ok()?;
+    // SAFETY: fd is a live TCP socket owned by `stream`; `info`/`len` describe a
+    // properly sized, writable out-buffer for this socket option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            core::ptr::from_mut(&mut info).cast(),
+            &mut len,
+        )
+    };
+    // tcpi_srtt is already in milliseconds on macOS.
+    (rc == 0).then(|| info.tcpi_srtt.max(1))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tcp_srtt_ms(_stream: &TcpStream) -> Option<u32> {
+    None
 }
 
 impl RdpServer {
@@ -1619,6 +1660,20 @@ impl RdpServer {
         }
         self.macrdp.audio_receiver = Some(Arc::new(Mutex::new(audio_receiver)));
         self.macrdp.channels = channels;
+    }
+
+    /// (macrdp divergence 15) Install a cell the server fills with each accepted
+    /// connection's kernel-smoothed TCP RTT in ms (0 = unknown).
+    pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
+        self.macrdp.link_rtt_ms = Some(handle);
+    }
+
+    /// (macrdp divergence 15) Publish this connection's accept-time TCP RTT (0 = unknown).
+    fn store_link_rtt(&self, rtt_ms: u32) {
+        if let Some(cell) = &self.macrdp.link_rtt_ms {
+            cell.store(rtt_ms, Ordering::Relaxed);
+            debug!(rtt_ms, "sampled TCP link RTT at accept");
+        }
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -2376,9 +2431,13 @@ impl RdpServer {
             transport,
             acceptor,
             local_addr,
+            link_rtt_ms,
         } = negotiated;
         if local_addr.is_some() {
             self.connection_local_addr = local_addr;
+        }
+        if let Some(rtt) = link_rtt_ms {
+            self.store_link_rtt(rtt);
         }
         match transport {
             // No security upgrade happened, so there is no TLS session to shut
@@ -2575,6 +2634,14 @@ impl RdpServer {
                     drop(stream);
                 }
                 continue;
+            }
+
+            // (macrdp divergence 15) Sample the kernel's smoothed TCP RTT while the
+            // concrete socket is still reachable (`run_connection` takes a generic
+            // stream). A preemption winner was sampled as a candidate instead and is
+            // stored in `finalize_negotiated`.
+            if let Entry::Fresh(stream, _) = &entry {
+                self.store_link_rtt(tcp_srtt_ms(stream).unwrap_or(0));
             }
 
             let started = tokio::time::Instant::now();
