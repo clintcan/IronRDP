@@ -21,6 +21,7 @@ pub mod efs;
 pub mod epc;
 pub mod esc;
 pub mod esp;
+mod server_direction; // (macrdp divergence 1) server-to-client request encoders
 
 /// All available RDPDR PDUs.
 pub enum RdpdrPdu {
