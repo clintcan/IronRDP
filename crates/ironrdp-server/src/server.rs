@@ -863,13 +863,14 @@ pub struct RdpServer {
     macrdp: MacrdpServerState,
 }
 
-/// (macrdp divergence 11) macrdp's own channel factories, kept alongside
+/// (macrdp divergences 11/16) macrdp's own channel factories, kept alongside
 /// upstream's equivalents (`with_rdpdr_factory`, `with_usb_factory`,
 /// `with_rdpeai_factory`), which macrdp never sets. Never enable both a macrdp
 /// factory and its upstream counterpart: they register the same channel name.
 #[derive(Default)]
 pub(crate) struct MacrdpChannelFactories {
     pub(crate) rdpdr_drive: Option<Box<dyn crate::RdpdrDriveServerFactory>>,
+    pub(crate) urbdrc: Option<Box<dyn crate::UrbdrcServerFactory>>,
 }
 
 /// (macrdp) Per-server state for macrdp's divergences. Grouped so the fork's
@@ -978,6 +979,8 @@ pub enum ServerEvent {
     Usb(UrbdrcServerMessage),
     /// (macrdp divergence 11) macrdp's own RDPDR drive + smart card channel.
     RdpdrDrive(crate::RdpdrDriveMessage),
+    /// (macrdp divergence 16) macrdp's own URBDRC USB channel.
+    Urbdrc(crate::UrbdrcServerMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1010,6 +1013,7 @@ impl fmt::Debug for ServerEvent {
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
             Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
+            Self::Urbdrc(..) => f.write_str("Urbdrc(..)"),
         }
     }
 }
@@ -1651,6 +1655,9 @@ impl RdpServer {
         if let Some(rdpdr) = channels.rdpdr_drive.as_mut() {
             rdpdr.set_sender(self.ev_sender.clone());
         }
+        if let Some(usb) = channels.urbdrc.as_mut() {
+            usb.set_sender(self.ev_sender.clone());
+        }
         // Bounded to ~1 s of audio at the steady-state 42.78 waves/s (1029
         // samples/wave at 44.1 kHz), so a stalled dispatch backpressures the
         // capture loop (losses land in the capture ring) instead of queueing here.
@@ -2154,8 +2161,19 @@ impl RdpServer {
             dvc
         };
 
+        // (macrdp divergence 16) macrdp's dynamic channels, advertised only
+        // when their factory is set.
         #[cfg(feature = "multitransport")]
         let dvc = self.mt_attach_audio_dvcs(dvc);
+        let dvc = {
+            let channels = &self.macrdp.channels;
+            let mut dvc = dvc;
+            if let Some(factory) = channels.urbdrc.as_deref() {
+                dvc = dvc.with_dynamic_channel(factory.build_processor());
+            }
+            dvc
+        };
+
         acceptor.attach_static_channel(dvc);
 
         for factory in &self.static_channel_factories {
@@ -2993,6 +3011,26 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
+    /// (macrdp divergence 16) Ship a DRDYNVC Create Request for a per-device DVC
+    /// opened from the event loop.
+    async fn write_drdynvc_create(
+        &self,
+        create_msg: ironrdp_svc::SvcMessage,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> ServerResult<()> {
+        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+            warn!("No DRDYNVC channel id, dropping the device channel's Create Request");
+            return Ok(());
+        };
+        let data = server_encode_svc_messages(vec![create_msg], drdynvc_channel_id, user_channel_id)
+            .map_err(ServerError::encode)?;
+        writer
+            .write_all(&data)
+            .await
+            .map_err(|e| ServerError::io("write_all", e))
+    }
+
     async fn dispatch_server_events(
         &mut self,
         events: &mut Vec<ServerEvent>,
@@ -3618,6 +3656,52 @@ impl RdpServer {
                     };
                     let data = server_encode_svc_messages(messages, channel_id, user_channel_id)
                         .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                // (macrdp divergence 16) The URBDRC processor announced a device and needs
+                // a per-device DVC. Only the event loop can reach DrdynvcServer, so open
+                // the channel here and ship the resulting CreateRequest.
+                ServerEvent::Urbdrc(crate::UrbdrcServerMessage::OpenDeviceChannel) => {
+                    // Clone the sender + presenting-side callback before the `&mut self`
+                    // borrow below; the device processor keeps them to ship transfers and
+                    // to hand the device to the presenting side.
+                    let sender = self.ev_sender.clone();
+                    let device_cb = self.macrdp.channels.urbdrc.as_deref().and_then(|f| f.device_callback());
+                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!("No DRDYNVC channel, cannot open URBDRC device channel");
+                        continue;
+                    };
+                    let create_msg =
+                        match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender, device_cb)) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "failed to create URBDRC device channel");
+                                continue;
+                            }
+                        };
+                    self.write_drdynvc_create(create_msg, writer, user_channel_id).await?;
+                }
+                // A UsbHandle ships a transfer on an open device channel. An encode error
+                // drops that transfer instead of ending the session: a URB the codec
+                // rejects must not kill an opt-in feature's connection (same principle as
+                // the URBDRC `process()` decode tolerance). A socket error stays fatal.
+                ServerEvent::Urbdrc(crate::UrbdrcServerMessage::SendMessages { channel_id, messages }) => {
+                    let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                        warn!("No DRDYNVC channel, dropping URBDRC transfer");
+                        continue;
+                    };
+                    let data = match dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty())
+                        .and_then(|m| server_encode_svc_messages(m, drdynvc_channel_id, user_channel_id))
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %e, "URBDRC: failed to encode a transfer request; dropping it (session kept alive)");
+                            continue;
+                        }
+                    };
                     writer
                         .write_all(&data)
                         .await

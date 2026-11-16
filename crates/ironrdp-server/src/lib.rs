@@ -9,6 +9,7 @@ mod macros;
 #[cfg(feature = "multitransport")]
 mod mt;
 mod rdpdr_drive;
+mod rdpeusb;
 
 pub mod autodetect;
 mod builder;
@@ -68,6 +69,10 @@ pub use rdpei::{
     PenContactFlags, PenEventPdu, PenFlags, PenFrame, RdpInputProtocolVersion, RdpeiHandler, RdpeiServer,
     RdpeiServerFactory, ScReadyFeatures, TouchContact, TouchContactDataFlags, TouchContactFields, TouchContactFlags,
     TouchEventPdu, TouchFrame,
+};
+pub use rdpeusb::{
+    DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,
+    UsbHandle, UsbPipe,
 };
 pub use server::{
     AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy, CredentialDecision,
