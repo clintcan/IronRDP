@@ -3433,7 +3433,7 @@ dependencies = [
  "tracing",
  "visibility",
  "x509-cert",
- "zstd-safe",
+ "zstd-safe 8.3.0",
 ]
 
 [[package]]
@@ -3453,7 +3453,7 @@ dependencies = [
  "qoicoubeh",
  "tracing",
  "visibility",
- "zstd-safe",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -8204,10 +8204,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+name = "zstd-safe"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
  "cc",
  "pkg-config",
