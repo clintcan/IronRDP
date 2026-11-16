@@ -40,6 +40,10 @@ pub struct Acceptor {
     keyboard_layout: u32,
     keyboard_type: gcc::KeyboardType,
     ime_file_name: String,
+    // (macrdp divergence 4) Client-fingerprint identity from the GCC Client Core Data.
+    client_name: String,
+    client_version: u32,
+    client_build: u32,
     /// The client's MultiTransportChannelData block flags (MS-RDPBCGR
     /// 2.2.1.3.8), when it sent one. `None` when the client did not send the
     /// block at all, distinct from `Some(empty())` (block present, no flags
@@ -176,6 +180,13 @@ pub struct AcceptorResult {
     ///
     /// Populated for East Asian IME-based input locales; empty otherwise.
     pub ime_file_name: String,
+    /// (macrdp divergence 4) Client computer name from its GCC Client Core Data
+    /// (section 2.2.1.3.2, `clientName`). Informational — a client can claim anything.
+    pub client_name: String,
+    /// (macrdp divergence 4) Raw RDP version from the GCC Client Core Data (`version`).
+    pub client_version: u32,
+    /// (macrdp divergence 4) Client build number from the GCC Client Core Data (`clientBuild`).
+    pub client_build: u32,
     /// Early capability flags announced by the client in its GCC Client Core
     /// Data (section 2.2.1.3.2, `earlyCapabilityFlags`).
     ///
@@ -230,6 +241,9 @@ impl Acceptor {
             keyboard_layout: 0,
             keyboard_type: gcc::KeyboardType(0),
             ime_file_name: String::new(),
+            client_name: String::new(),
+            client_version: 0,
+            client_build: 0,
             multitransport_flags: None,
             early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             server_capabilities: capabilities,
@@ -465,6 +479,9 @@ impl Acceptor {
             keyboard_layout: consumed.keyboard_layout,
             keyboard_type: consumed.keyboard_type,
             ime_file_name: consumed.ime_file_name,
+            client_name: consumed.client_name,
+            client_version: consumed.client_version,
+            client_build: consumed.client_build,
             multitransport_flags: consumed.multitransport_flags,
             early_capability_flags: consumed.early_capability_flags,
             server_capabilities: consumed.server_capabilities,
@@ -570,6 +587,9 @@ impl Acceptor {
                 keyboard_layout: self.keyboard_layout,
                 keyboard_type: self.keyboard_type,
                 ime_file_name: self.ime_file_name.clone(),
+                client_name: self.client_name.clone(),
+                client_version: self.client_version,
+                client_build: self.client_build,
                 multitransport_flags: self
                     .multitransport_flags
                     .unwrap_or_else(gcc::MultiTransportFlags::empty),
@@ -881,6 +901,10 @@ impl Sequence for Acceptor {
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.keyboard_type = gcc_blocks.core.keyboard_type;
                 self.ime_file_name.clone_from(&gcc_blocks.core.ime_file_name);
+                // (macrdp divergence 4) Client-fingerprint identity.
+                self.client_name.clone_from(&gcc_blocks.core.client_name);
+                self.client_version = gcc_blocks.core.version.0;
+                self.client_build = gcc_blocks.core.client_build;
                 self.multitransport_flags = gcc_blocks.multi_transport_channel.as_ref().map(|m| m.flags);
 
                 // Adopt the client's requested desktop size (from its Client
