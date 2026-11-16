@@ -82,6 +82,9 @@ pub struct Acceptor {
     /// success. `None` until a matching response arrives. See
     /// [`AcceptorResult::multitransport_response_success`].
     received_multitransport_response: Option<bool>,
+    // (macrdp divergence 5) Which UDP transport the Initiate Multitransport Request
+    // asks for. See `set_multitransport_requested_protocol()`.
+    requested_multitransport_protocol: rdp::multitransport::RequestedProtocol,
 }
 
 /// Source of randomness for the security cookie and request ID the acceptor
@@ -259,6 +262,7 @@ impl Acceptor {
             sent_multitransport_request: None,
             multitransport_security_rng: Box::new(OsMultitransportSecurityRng),
             received_multitransport_response: None,
+            requested_multitransport_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
         }
     }
 
@@ -348,6 +352,17 @@ impl Acceptor {
     /// reciprocating client attempt a UDP connection that cannot succeed.
     pub fn set_multitransport_offer(&mut self, flags: Option<gcc::MultiTransportFlags>) {
         self.offer_multitransport = flags;
+    }
+
+    /// (macrdp divergence 5) Choose which UDP transport the Initiate Multitransport
+    /// Request asks for: reliable (`UdpFecR`, the default) or lossy (`UdpFecL`).
+    ///
+    /// The request is sent only when [`set_multitransport_offer()`](Self::set_multitransport_offer)
+    /// advertised the matching transport flag (`TRANSPORT_TYPE_UDP_FECR` /
+    /// `TRANSPORT_TYPE_UDP_FECL`) and the client reciprocated it. Like the offer, only a
+    /// call made before `MultitransportBootstrapping` takes effect.
+    pub fn set_multitransport_requested_protocol(&mut self, protocol: rdp::multitransport::RequestedProtocol) {
+        self.requested_multitransport_protocol = protocol;
     }
 
     /// Returns the Initiate Multitransport Request sent to the client, if
@@ -497,6 +512,7 @@ impl Acceptor {
             sent_multitransport_request: consumed.sent_multitransport_request,
             multitransport_security_rng: consumed.multitransport_security_rng,
             received_multitransport_response: consumed.received_multitransport_response,
+            requested_multitransport_protocol: consumed.requested_multitransport_protocol,
         })
     }
 
@@ -1179,12 +1195,22 @@ impl Sequence for Acceptor {
                     channels,
                 };
 
-                let offer_udp_fecr = self
+                // (macrdp divergence 5) Gate on the transport actually requested.
+                let requested_protocol = self.requested_multitransport_protocol;
+                let transport_flag = match requested_protocol {
+                    rdp::multitransport::RequestedProtocol::UdpFecR => {
+                        gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                    }
+                    rdp::multitransport::RequestedProtocol::UdpFecL => {
+                        gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                    }
+                };
+                let offer_transport = self
                     .advertised_multitransport
-                    .is_some_and(|offer| offer.contains(gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
-                let client_supports_udp_fecr = self
+                    .is_some_and(|offer| offer.contains(transport_flag));
+                let client_supports_transport = self
                     .multitransport_flags
-                    .is_some_and(|flags| flags.contains(gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+                    .is_some_and(|flags| flags.contains(transport_flag));
                 // 2.2.15.1 requires the request to travel on the MCS message
                 // channel. A client can in principle advertise UDP support
                 // without also requesting a message channel; rather than
@@ -1193,7 +1219,7 @@ impl Sequence for Acceptor {
                 // offering.
                 let message_channel_id = self
                     .message_channel_id
-                    .filter(|_| offer_udp_fecr && client_supports_udp_fecr);
+                    .filter(|_| offer_transport && client_supports_transport);
 
                 if let Some(message_channel_id) = message_channel_id {
                     let mut security_cookie = [0u8; 16];
@@ -1206,7 +1232,7 @@ impl Sequence for Acceptor {
                             flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
                         },
                         request_id,
-                        requested_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
+                        requested_protocol,
                         security_cookie,
                     };
 
@@ -1220,8 +1246,8 @@ impl Sequence for Acceptor {
                     (Written::from_size(written)?, next_state)
                 } else {
                     debug!(
-                        offer_udp_fecr,
-                        client_supports_udp_fecr, "Not offering UDP multitransport"
+                        ?requested_protocol,
+                        offer_transport, client_supports_transport, "Not offering UDP multitransport"
                     );
                     (Written::Nothing, next_state)
                 }
