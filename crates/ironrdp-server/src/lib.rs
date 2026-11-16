@@ -58,7 +58,7 @@ pub use server::{
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
 };
-pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
+pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]
 pub use urbdrc::{
     CompletionFut, DeviceFactory, PendingHandle, PendingRequest, RdpUsbDeviceAnnounceInfo, UsbDeviceHandle,

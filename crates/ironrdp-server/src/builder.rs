@@ -548,6 +548,7 @@ impl RdpServerBuilder<BuilderDone> {
         );
         server.set_credential_validator(self.state.credential_validator);
         server.set_auto_reconnect_cookie(self.state.auto_reconnect_cookie);
+        server.install_macrdp_channels();
         server
     }
 }
