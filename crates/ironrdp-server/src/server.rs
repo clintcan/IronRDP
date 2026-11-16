@@ -882,7 +882,7 @@ pub struct RdpServer {
     macrdp: MacrdpServerState,
 }
 
-/// (macrdp divergences 11/16/19) macrdp's own channel factories, kept alongside
+/// (macrdp divergences 11/16/19/25) macrdp's own channel factories, kept alongside
 /// upstream's equivalents (`with_rdpdr_factory`, `with_usb_factory`,
 /// `with_rdpeai_factory`), which macrdp never sets. Never enable both a macrdp
 /// factory and its upstream counterpart: they register the same channel name.
@@ -891,6 +891,7 @@ pub(crate) struct MacrdpChannelFactories {
     pub(crate) rdpdr_drive: Option<Box<dyn crate::RdpdrDriveServerFactory>>,
     pub(crate) urbdrc: Option<Box<dyn crate::UrbdrcServerFactory>>,
     pub(crate) camera: Option<Box<dyn crate::RdCameraServerFactory>>,
+    pub(crate) audin: Option<Box<dyn crate::AudinServerFactory>>,
 }
 
 /// (macrdp) Per-server state for macrdp's divergences. Grouped so the fork's
@@ -2230,7 +2231,7 @@ impl RdpServer {
             dvc
         };
 
-        // (macrdp divergences 16/19) macrdp's dynamic channels, advertised only
+        // (macrdp divergences 16/19/25) macrdp's dynamic channels, advertised only
         // when their factory is set.
         #[cfg(feature = "multitransport")]
         let dvc = self.mt_attach_audio_dvcs(dvc);
@@ -2241,6 +2242,9 @@ impl RdpServer {
                 dvc = dvc.with_dynamic_channel(factory.build_processor());
             }
             if let Some(factory) = channels.camera.as_deref() {
+                dvc = dvc.with_dynamic_channel(factory.build_processor());
+            }
+            if let Some(factory) = channels.audin.as_deref() {
                 dvc = dvc.with_dynamic_channel(factory.build_processor());
             }
             dvc
