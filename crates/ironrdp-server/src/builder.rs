@@ -292,6 +292,13 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// (macrdp divergence 19) Configure server-direction MS-RDPECAM (camera
+    /// redirection). When set, the `RDCamera_Device_Enumerator` DVC is advertised.
+    pub fn with_camera_factory(mut self, factory: Option<Box<dyn crate::RdCameraServerFactory>>) -> Self {
+        self.state.macrdp_channels.camera = factory;
+        self
+    }
+
     pub fn with_bitmap_codecs(mut self, codecs: BitmapCodecs) -> Self {
         self.state.codecs = codecs;
         self

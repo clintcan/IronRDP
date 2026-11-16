@@ -873,7 +873,7 @@ pub struct RdpServer {
     macrdp: MacrdpServerState,
 }
 
-/// (macrdp divergences 11/16) macrdp's own channel factories, kept alongside
+/// (macrdp divergences 11/16/19) macrdp's own channel factories, kept alongside
 /// upstream's equivalents (`with_rdpdr_factory`, `with_usb_factory`,
 /// `with_rdpeai_factory`), which macrdp never sets. Never enable both a macrdp
 /// factory and its upstream counterpart: they register the same channel name.
@@ -881,6 +881,7 @@ pub struct RdpServer {
 pub(crate) struct MacrdpChannelFactories {
     pub(crate) rdpdr_drive: Option<Box<dyn crate::RdpdrDriveServerFactory>>,
     pub(crate) urbdrc: Option<Box<dyn crate::UrbdrcServerFactory>>,
+    pub(crate) camera: Option<Box<dyn crate::RdCameraServerFactory>>,
 }
 
 /// (macrdp) Per-server state for macrdp's divergences. Grouped so the fork's
@@ -991,6 +992,8 @@ pub enum ServerEvent {
     RdpdrDrive(crate::RdpdrDriveMessage),
     /// (macrdp divergence 16) macrdp's own URBDRC USB channel.
     Urbdrc(crate::UrbdrcServerMessage),
+    /// (macrdp divergence 19) MS-RDPECAM camera channel.
+    Camera(crate::CameraServerMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1024,6 +1027,7 @@ impl fmt::Debug for ServerEvent {
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
             Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
             Self::Urbdrc(..) => f.write_str("Urbdrc(..)"),
+            Self::Camera(..) => f.write_str("Camera(..)"),
         }
     }
 }
@@ -1695,6 +1699,9 @@ impl RdpServer {
         if let Some(usb) = channels.urbdrc.as_mut() {
             usb.set_sender(self.ev_sender.clone());
         }
+        if let Some(camera) = channels.camera.as_mut() {
+            camera.set_sender(self.ev_sender.clone());
+        }
         // Bounded to ~1 s of audio at the steady-state 42.78 waves/s (1029
         // samples/wave at 44.1 kHz), so a stalled dispatch backpressures the
         // capture loop (losses land in the capture ring) instead of queueing here.
@@ -2198,7 +2205,7 @@ impl RdpServer {
             dvc
         };
 
-        // (macrdp divergence 16) macrdp's dynamic channels, advertised only
+        // (macrdp divergences 16/19) macrdp's dynamic channels, advertised only
         // when their factory is set.
         #[cfg(feature = "multitransport")]
         let dvc = self.mt_attach_audio_dvcs(dvc);
@@ -2206,6 +2213,9 @@ impl RdpServer {
             let channels = &self.macrdp.channels;
             let mut dvc = dvc;
             if let Some(factory) = channels.urbdrc.as_deref() {
+                dvc = dvc.with_dynamic_channel(factory.build_processor());
+            }
+            if let Some(factory) = channels.camera.as_deref() {
                 dvc = dvc.with_dynamic_channel(factory.build_processor());
             }
             dvc
@@ -3050,7 +3060,7 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
-    /// (macrdp divergence 16) Ship a DRDYNVC Create Request for a per-device DVC
+    /// (macrdp divergences 16/19) Ship a DRDYNVC Create Request for a per-device DVC
     /// opened from the event loop.
     async fn write_drdynvc_create(
         &self,
@@ -3745,6 +3755,31 @@ impl RdpServer {
                         .write_all(&data)
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                // (macrdp divergence 19) The MS-RDPECAM enumerator announced a camera and
+                // needs a per-device DVC with the client-given name. The device processor
+                // drives the negotiation and sample pull loop from its own start()/process()
+                // return values, so no sender is threaded into it.
+                ServerEvent::Camera(crate::CameraServerMessage::OpenDeviceChannel { channel_name, version }) => {
+                    let sink = self
+                        .macrdp
+                        .channels
+                        .camera
+                        .as_deref()
+                        .and_then(|f| f.build_sample_sink());
+                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!("No DRDYNVC channel, cannot open MS-RDPECAM device channel");
+                        continue;
+                    };
+                    let processor = crate::RdCameraDeviceProcessor::new(channel_name, version, sink);
+                    let create_msg = match drdynvc.create_channel(processor) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(error = %e, "failed to create MS-RDPECAM device channel");
+                            continue;
+                        }
+                    };
+                    self.write_drdynvc_create(create_msg, writer, user_channel_id).await?;
                 }
             }
         }
