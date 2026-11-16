@@ -2918,6 +2918,8 @@ impl RdpServer {
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
             .count();
         let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        #[cfg(feature = "egfx")]
+        prioritize_batch(events);
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -4985,6 +4987,36 @@ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut i
         .await
         .map_err(|e| ServerError::io("write deactivate_all", e))?;
     Ok(())
+}
+
+/// (macrdp divergence 4) Reorder one drained event batch into three tiers, CLIPRDR,
+/// then EGFX video and everything else, then RDPDR, since all of them share the one
+/// socket writer.
+///
+/// - CLIPRDR first: with H.264 on, a small FileContentsResponse otherwise queues
+///   behind dozens of large video frames every batch, throttling a Mac-to-Windows
+///   file copy to a crawl and freezing Explorer's synchronous paste read.
+/// - RDPDR last: a large drive write (copying TO the redirected drive) otherwise
+///   holds the writer ahead of the video frames in the same batch and stutters video.
+///
+/// Stable within each tier, so H.264 frames keep their order for the inter-frame
+/// chain. CLIPRDR and RDPDR ride their own channels, so reordering them against EGFX
+/// breaks no on-wire ordering. Audio isn't affected: it ships per wave from its own
+/// task (`dispatch_audio`), keeping its natural cadence.
+#[cfg(feature = "egfx")]
+fn prioritize_batch(events: &mut [ServerEvent]) {
+    fn tier(event: &ServerEvent) -> u8 {
+        match event {
+            ServerEvent::Clipboard(_) => 0,
+            ServerEvent::Rdpdr(_) => 2,
+            _ => 1,
+        }
+    }
+    let has_egfx = events.iter().any(|e| matches!(e, ServerEvent::Egfx(_)));
+    if has_egfx && events.iter().any(|e| tier(e) != 1) {
+        // `sort_by_key` is stable.
+        events.sort_by_key(tier);
+    }
 }
 
 /// (macrdp divergences 2/3/8) The audio-lag model of `client_loop`'s `dispatch_audio`.
