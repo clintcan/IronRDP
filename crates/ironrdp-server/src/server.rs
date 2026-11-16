@@ -857,10 +857,20 @@ pub struct RdpServer {
     macrdp: MacrdpServerState,
 }
 
+/// (macrdp divergence 11) macrdp's own channel factories, kept alongside
+/// upstream's equivalents (`with_rdpdr_factory`, `with_usb_factory`,
+/// `with_rdpeai_factory`), which macrdp never sets. Never enable both a macrdp
+/// factory and its upstream counterpart: they register the same channel name.
+#[derive(Default)]
+pub(crate) struct MacrdpChannelFactories {
+    pub(crate) rdpdr_drive: Option<Box<dyn crate::RdpdrDriveServerFactory>>,
+}
+
 /// (macrdp) Per-server state for macrdp's divergences. Grouped so the fork's
 /// additions to `RdpServer` stay one block; see CLAUDE.md for each.
 #[derive(Default)]
 struct MacrdpServerState {
+    channels: MacrdpChannelFactories,
     /// (2/8) Dedicated audio channel; drained by `dispatch_audio` in `client_loop`.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>>,
 }
@@ -955,6 +965,8 @@ pub enum ServerEvent {
     AutoDetectRttRequest,
     #[cfg(feature = "usb")]
     Usb(UrbdrcServerMessage),
+    /// (macrdp divergence 11) macrdp's own RDPDR drive + smart card channel.
+    RdpdrDrive(crate::RdpdrDriveMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -986,6 +998,7 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+            Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
         }
     }
 }
@@ -1582,9 +1595,12 @@ impl RdpServer {
         }
     }
 
-    /// (macrdp) Installs macrdp's dedicated audio channel.
+    /// (macrdp) Installs macrdp's channel factories and its dedicated audio channel.
     /// Called once by the builder, right after [`Self::new`].
-    pub(crate) fn install_macrdp_channels(&mut self) {
+    pub(crate) fn install_macrdp_channels(&mut self, mut channels: MacrdpChannelFactories) {
+        if let Some(rdpdr) = channels.rdpdr_drive.as_mut() {
+            rdpdr.set_sender(self.ev_sender.clone());
+        }
         // Bounded to ~1 s of audio at the steady-state 42.78 waves/s (1029
         // samples/wave at 44.1 kHz), so a stalled dispatch backpressures the
         // capture loop (losses land in the capture ring) instead of queueing here.
@@ -1593,6 +1609,7 @@ impl RdpServer {
             snd.set_audio_sender(audio_sender);
         }
         self.macrdp.audio_receiver = Some(Arc::new(Mutex::new(audio_receiver)));
+        self.macrdp.channels = channels;
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -2013,6 +2030,12 @@ impl RdpServer {
             let backend = factory.build_backend();
 
             acceptor.attach_static_channel(RdpdrServer::new(backend));
+        }
+
+        // (macrdp divergence 11) macrdp's RDPDR, also right after RDPSND as MS-RDPEFS
+        // requires.
+        if let Some(factory) = self.macrdp.channels.rdpdr_drive.as_deref() {
+            acceptor.attach_static_channel(crate::rdpdr_drive::build_rdpdr_drive(factory, self.ev_sender.clone()));
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
@@ -3495,6 +3518,19 @@ impl RdpServer {
                                 .map_err(|e| ServerError::io("write_all", e))?;
                         }
                     }
+                }
+                // (macrdp divergence 11) Ship macrdp's RDPDR device-I/O requests.
+                ServerEvent::RdpdrDrive(crate::RdpdrDriveMessage::SendMessages(messages)) => {
+                    let Some(channel_id) = self.get_channel_id_by_type::<crate::RdpdrDriveServer>() else {
+                        warn!("No RDPDR channel, dropping device-I/O request");
+                        continue;
+                    };
+                    let data = server_encode_svc_messages(messages, channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
                 }
             }
         }
@@ -5008,7 +5044,7 @@ fn prioritize_batch(events: &mut [ServerEvent]) {
     fn tier(event: &ServerEvent) -> u8 {
         match event {
             ServerEvent::Clipboard(_) => 0,
-            ServerEvent::Rdpdr(_) => 2,
+            ServerEvent::Rdpdr(_) | ServerEvent::RdpdrDrive(_) => 2,
             _ => 1,
         }
     }

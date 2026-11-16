@@ -13,8 +13,8 @@ use super::display::{DesktopSize, RdpServerDisplay};
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{
-    ConnectionHandler, ConnectionPolicy, CredentialValidator, RdpServer, RdpServerOptions, RdpServerSecurity,
-    StaticChannelFactory,
+    ConnectionHandler, ConnectionPolicy, CredentialValidator, MacrdpChannelFactories, RdpServer, RdpServerOptions,
+    RdpServerSecurity, StaticChannelFactory,
 };
 use crate::error::ServerResult;
 #[cfg(feature = "usb")]
@@ -67,6 +67,8 @@ pub struct BuilderDone {
     remotefx_quant: Quant,
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
+    /// (macrdp) macrdp's own channel factories; see `MacrdpChannelFactories`.
+    macrdp_channels: MacrdpChannelFactories,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -182,6 +184,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                macrdp_channels: MacrdpChannelFactories::default(),
             },
         }
     }
@@ -218,6 +221,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                macrdp_channels: MacrdpChannelFactories::default(),
             },
         }
     }
@@ -267,6 +271,15 @@ impl RdpServerBuilder<BuilderDone> {
     #[cfg(feature = "usb")]
     pub fn with_usb_factory(mut self, usb_factory: Option<Box<dyn DeviceFactory>>) -> Self {
         self.state.usb_factory = usb_factory;
+        self
+    }
+
+    /// (macrdp divergence 11) Configure macrdp's RDPDR drive + smart card channel.
+    /// The client's redirected devices are surfaced to the
+    /// [`RdpdrServerHandler`](crate::RdpdrServerHandler) backend. Don't combine
+    /// with [`Self::with_rdpdr_factory`]: both register the `RDPDR` channel.
+    pub fn with_rdpdr_drive_factory(mut self, factory: Option<Box<dyn crate::RdpdrDriveServerFactory>>) -> Self {
+        self.state.macrdp_channels.rdpdr_drive = factory;
         self
     }
 
@@ -548,7 +561,7 @@ impl RdpServerBuilder<BuilderDone> {
         );
         server.set_credential_validator(self.state.credential_validator);
         server.set_auto_reconnect_cookie(self.state.auto_reconnect_cookie);
-        server.install_macrdp_channels();
+        server.install_macrdp_channels(self.state.macrdp_channels);
         server
     }
 }
