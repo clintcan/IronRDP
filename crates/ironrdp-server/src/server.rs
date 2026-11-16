@@ -853,6 +853,16 @@ pub struct RdpServer {
     /// response over TCP, so its first tunnel data can overtake it; this holds
     /// that data until the response is in instead of dropping it.
     early_tunnel_payloads: VecDeque<Vec<u8>>,
+    /// (macrdp) Everything macrdp adds per server, in one place. See [`MacrdpServerState`].
+    macrdp: MacrdpServerState,
+}
+
+/// (macrdp) Per-server state for macrdp's divergences. Grouped so the fork's
+/// additions to `RdpServer` stay one block; see CLAUDE.md for each.
+#[derive(Default)]
+struct MacrdpServerState {
+    /// (2/8) Dedicated audio channel; drained by `dispatch_audio` in `client_loop`.
+    audio_receiver: Option<Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>>,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -1568,7 +1578,21 @@ impl RdpServer {
             udp_migration_allowed: false,
             egfx_on_udp: false,
             early_tunnel_payloads: VecDeque::new(),
+            macrdp: MacrdpServerState::default(),
         }
+    }
+
+    /// (macrdp) Installs macrdp's dedicated audio channel.
+    /// Called once by the builder, right after [`Self::new`].
+    pub(crate) fn install_macrdp_channels(&mut self) {
+        // Bounded to ~1 s of audio at the steady-state 42.78 waves/s (1029
+        // samples/wave at 44.1 kHz), so a stalled dispatch backpressures the
+        // capture loop (losses land in the capture ring) instead of queueing here.
+        let (audio_sender, audio_receiver) = mpsc::channel::<crate::AudioWave>(50);
+        if let Some(snd) = self.sound_factory.as_mut() {
+            snd.set_audio_sender(audio_sender);
+        }
+        self.macrdp.audio_receiver = Some(Arc::new(Mutex::new(audio_receiver)));
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -2104,6 +2128,21 @@ impl RdpServer {
 
         for event in keep {
             let _ = self.ev_sender.send(event);
+        }
+
+        // (macrdp divergence 2) The replaced session's audio rides its own channel;
+        // up to ~1 s of it may still be queued. If its task somehow still holds the
+        // receiver, skip: the next connection's lag model drops stale waves anyway.
+        if let Some(audio_receiver) = &self.macrdp.audio_receiver
+            && let Ok(mut audio_receiver) = audio_receiver.try_lock()
+        {
+            let mut stale_waves = 0usize;
+            while audio_receiver.try_recv().is_ok() {
+                stale_waves += 1;
+            }
+            if stale_waves > 0 {
+                debug!(stale_waves, "dropped audio the replaced session never shipped");
+            }
         }
     }
 
@@ -3749,6 +3788,8 @@ impl RdpServer {
         let mut auto_reconnect_writer = writer.clone();
         let mut heartbeat_writer = writer.clone();
         let mut udp_tunnel_writer = writer.clone();
+        let mut audio_writer = writer.clone();
+        let audio_receiver = self.macrdp.audio_receiver.clone();
         let udp_transport_for_events = Rc::clone(&udp_transport);
         let udp_transport_for_pdus = Rc::clone(&udp_transport);
         let write_counter = writer.write_counter();
@@ -4038,6 +4079,62 @@ impl RdpServer {
             }
         };
 
+        // (macrdp divergences 2/3/8) Audio rides its own bounded channel and task, so
+        // a sustained inbound stream (a large clipboard paste) can't starve it, and a
+        // stalled writer drops stale waves instead of replaying them late. `Self` is
+        // locked only briefly per wave to build the PDU; the write happens outside it.
+        let this = Rc::clone(&s);
+        let dispatch_audio = async move {
+            let Some(audio_receiver) = audio_receiver else {
+                return core::future::pending::<ServerResult<RunState>>().await;
+            };
+            let mut audio_receiver = audio_receiver.lock().await;
+            // Fresh per connection: the task is created inside client_loop.
+            let mut lag = AudioLagModel::default();
+            loop {
+                let Some((data, ts, duration_ms)) = audio_receiver.recv().await else {
+                    debug!("audio channel closed; stopping audio dispatch");
+                    break Ok(RunState::Disconnect);
+                };
+                let wave_ms = AudioLagModel::wave_ms(data.len(), duration_ms);
+                if !lag.admit(Instant::now(), wave_ms) {
+                    continue;
+                }
+
+                let encoded = {
+                    let mut this = this.lock().await;
+                    let Some(rdpsnd) = this.get_svc_processor::<RdpsndServer>() else {
+                        warn!("No rdpsnd channel, dropping wave");
+                        continue;
+                    };
+                    // A wave captured before this connection's rdpsnd channel has
+                    // negotiated a format has nowhere to go yet.
+                    if !rdpsnd.is_ready() {
+                        debug!("Dropping wave: rdpsnd channel not negotiated yet");
+                        continue;
+                    }
+                    let msgs = match rdpsnd.wave(data, ts) {
+                        Ok(m) => m,
+                        Err(error) => {
+                            warn!(?error, "rdpsnd.wave failed");
+                            continue;
+                        }
+                    };
+                    let Some(channel_id) = this.get_channel_id_by_type::<RdpsndServer>() else {
+                        warn!("rdpsnd SVC channel id missing");
+                        continue;
+                    };
+                    server_encode_svc_messages(msgs.into(), channel_id, user_channel_id).map_err(ServerError::encode)?
+                };
+
+                audio_writer
+                    .write_all(&encoded)
+                    .await
+                    .map_err(|e| ServerError::io("write_all", e))?;
+                lag.shipped(wave_ms);
+            }
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
@@ -4045,6 +4142,7 @@ impl RdpServer {
             state = refresh_auto_reconnect_cookie => state,
             state = send_heartbeats => state,
             state = dispatch_udp_tunnel => state,
+            state = dispatch_audio => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -4887,6 +4985,63 @@ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut i
         .await
         .map_err(|e| ServerError::io("write deactivate_all", e))?;
     Ok(())
+}
+
+/// (macrdp divergences 2/3/8) The audio-lag model of `client_loop`'s `dispatch_audio`.
+///
+/// Tracks the client's projected playback buffer as audio shipped minus wall time
+/// elapsed since the first wave. A wave that would push it past [`Self::MAX_LAG_MS`]
+/// is dropped (the oldest go first, since waves arrive in order), so slow drift from
+/// many small client pauses is caught, not just one big stall. When the writer stalls
+/// (mstsc freezing the socket during a window resize blocks the shared writer), wall
+/// time outruns shipped audio; past [`Self::RESYNC_DEFICIT_MS`] the model resyncs to
+/// live instead of reading the gap as a starving client and shipping the whole stale
+/// backlog late.
+#[derive(Default)]
+struct AudioLagModel {
+    shipped_ms: f64,
+    clock_start: Option<Instant>,
+}
+
+impl AudioLagModel {
+    const MAX_LAG_MS: f64 = 200.0;
+    const RESYNC_DEFICIT_MS: f64 = 300.0;
+    /// 16-bit stereo PCM at 44.1 kHz: 4 bytes/frame × 44 100 = 176.4 bytes per ms.
+    const PCM_BYTES_PER_MS: f64 = 176.4;
+
+    /// A wave's playback time. A compressed codec (AAC) passes its own duration: its
+    /// byte length bears no fixed relation to playback time (a ~120-byte AU is ~23 ms).
+    #[expect(clippy::cast_precision_loss, reason = "a wave is far below 2^52 bytes")]
+    fn wave_ms(len: usize, duration_ms: Option<f64>) -> f64 {
+        duration_ms.unwrap_or_else(|| len as f64 / Self::PCM_BYTES_PER_MS)
+    }
+
+    /// Whether to ship a wave of `wave_ms` at `now`.
+    fn admit(&mut self, now: Instant, wave_ms: f64) -> bool {
+        let start = *self.clock_start.get_or_insert(now);
+        let elapsed_ms = (now - start).as_secs_f64() * 1000.0;
+        let deficit_ms = elapsed_ms - self.shipped_ms;
+        if deficit_ms > Self::RESYNC_DEFICIT_MS {
+            debug!(target: "audio_backlog", deficit_ms, "writer stalled; resyncing audio clock to live");
+            self.shipped_ms = elapsed_ms;
+        }
+        let projected_buffer_ms = self.shipped_ms + wave_ms - elapsed_ms;
+        if projected_buffer_ms > Self::MAX_LAG_MS {
+            debug!(
+                target: "audio_backlog",
+                projected_buffer_ms,
+                wave_ms,
+                "dropping wave (projected buffer over MAX_LAG_MS)"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Record that an admitted wave was shipped.
+    fn shipped(&mut self, wave_ms: f64) {
+        self.shipped_ms += wave_ms;
+    }
 }
 
 /// The [`ConnectionHandler`] shared between `run`'s live connection and a
