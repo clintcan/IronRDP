@@ -140,6 +140,20 @@ fn migrate_egfx_lossy() -> bool {
     *ENABLED.get_or_init(|| env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
 }
 
+/// Link-RTT gate: a connection whose accept-time TCP RTT is at or above
+/// `MACRDP_UDP_OFFER_MAX_RTT_MS` (default 80; 0 disables) runs plain TCP from the
+/// first byte. On overlay links (VPN, ZeroTier, mobile) the tunnel predictably
+/// wedges. Read once.
+fn offer_max_rtt_ms() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MACRDP_UDP_OFFER_MAX_RTT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(80)
+    })
+}
+
 fn tunnel_name(tunnel: SoftSyncTunnelType) -> &'static str {
     if tunnel == SoftSyncTunnelType::LOSSY_UDP {
         "lossy (UdpFecL)"
@@ -217,6 +231,21 @@ impl RdpServer {
             .is_some_and(CookieRegistry::multitransport_suppressed)
         {
             info!("multitransport offer SUPPRESSED (tunnel-death cooldown) — this connection runs plain TCP");
+            return;
+        }
+        let max_rtt = offer_max_rtt_ms();
+        let rtt = self
+            .macrdp
+            .link_rtt_ms
+            .as_ref()
+            .map_or(0, |c| c.load(Ordering::Relaxed));
+        if max_rtt > 0 && rtt >= max_rtt {
+            info!(
+                link_rtt_ms = rtt,
+                max_rtt_ms = max_rtt,
+                "multitransport offer WITHHELD (link RTT above the offer gate) — this connection runs plain TCP; \
+                 UDP tunnels wedge on high-latency overlay links"
+            );
             return;
         }
 
