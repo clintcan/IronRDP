@@ -900,6 +900,8 @@ struct MacrdpServerState {
     channels: MacrdpChannelFactories,
     /// (2/8) Dedicated audio channel; drained by `dispatch_audio` in `client_loop`.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>>,
+    /// (24) Raised once per served connection; macrdp's input handler drains it.
+    input_reset_request: Option<Arc<AtomicBool>>,
     /// (15) Kernel TCP RTT sampled at accept, in ms (0 = unknown).
     link_rtt_ms: Option<Arc<AtomicU32>>,
     /// (12) macrdp's UDP multitransport.
@@ -1722,6 +1724,13 @@ impl RdpServer {
         self.macrdp.channels = channels;
     }
 
+    /// (macrdp divergence 24) Install a flag the server raises once per served
+    /// connection (not on a deactivation–reactivation, not for a losing preemption
+    /// candidate), so the input handler can reset per-connection state.
+    pub fn set_input_reset_handle(&mut self, handle: Arc<AtomicBool>) {
+        self.macrdp.input_reset_request = Some(handle);
+    }
+
     /// (macrdp divergence 15) Install a cell the server fills with each accepted
     /// connection's kernel-smoothed TCP RTT in ms (0 = unknown).
     pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
@@ -1733,6 +1742,13 @@ impl RdpServer {
         if let Some(cell) = &self.macrdp.link_rtt_ms {
             cell.store(rtt_ms, Ordering::Relaxed);
             debug!(rtt_ms, "sampled TCP link RTT at accept");
+        }
+    }
+
+    /// (macrdp divergence 24) Raise the input-reset flag for a newly served connection.
+    fn raise_input_reset(&self) {
+        if let Some(flag) = &self.macrdp.input_reset_request {
+            flag.store(true, Ordering::Relaxed);
         }
     }
 
@@ -2328,6 +2344,7 @@ impl RdpServer {
     /// connection.
     async fn serve_negotiated(&mut self, candidate: Box<NegotiatedCandidate>) -> ServerResult<()> {
         self.display_suppressed.store(false, Ordering::Relaxed);
+        self.raise_input_reset();
 
         let mut candidate = candidate;
         // Only NOW build the channel backends: this connection has
@@ -2464,6 +2481,7 @@ impl RdpServer {
         // here also covers backends that share an externally-created Arc via
         // `set_display_suppressed_handle()`.
         self.display_suppressed.store(false, Ordering::Relaxed);
+        self.raise_input_reset();
 
         let size = self.display.lock().await.size().await;
         let monitor_count = self.display.lock().await.monitor_count().await;
