@@ -1331,7 +1331,8 @@ impl DeviceAnnounceHeader {
         }
     }
 
-    pub(crate) fn device_type(&self) -> DeviceType {
+    // (macrdp divergence 1) `pub` (upstream: `pub(crate)`): the server reads the announced type.
+    pub fn device_type(&self) -> DeviceType {
         self.device_type
     }
 
