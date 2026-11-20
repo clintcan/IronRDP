@@ -164,6 +164,16 @@ fn set_bitmap_desktop_size(capabilities: &mut [CapabilitySet], size: DesktopSize
     }
 }
 
+/// (macrdp divergence 7) Where the server can run Optional Connect-Time
+/// Auto-Detection; see [`Acceptor::connect_time_autodetect_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectTimeAutoDetectWindow {
+    /// MCS message channel the auto-detect PDUs travel on.
+    pub message_channel_id: u16,
+    /// MCS user channel, the initiator for server-to-client PDUs.
+    pub user_channel_id: u16,
+}
+
 #[derive(Debug)]
 pub struct AcceptorResult {
     pub static_channels: StaticChannelSet,
@@ -632,6 +642,32 @@ impl Acceptor {
             .expect("transition to next state");
         debug_assert!(!self.should_perform_credssp());
         assert_eq!(res, Written::Nothing);
+    }
+
+    /// (macrdp divergence 7) The window for Optional Connect-Time Auto-Detection
+    /// ([MS-RDPBCGR] 1.3.8): the Client Info PDU has been received and licensing
+    /// has not started yet. `Some` only when the client advertised
+    /// `SUPPORT_NET_CHAR_AUTODETECT` in its early capability flags and joined the
+    /// MCS message channel the auto-detect PDUs travel on, and never during a
+    /// deactivation-reactivation, which does not repeat this phase.
+    ///
+    /// A client in this phase reads the message channel until the first licensing
+    /// PDU arrives on the I/O channel, so the server may exchange auto-detect PDUs
+    /// with it before stepping the acceptor on.
+    pub fn connect_time_autodetect_window(&self) -> Option<ConnectTimeAutoDetectWindow> {
+        if self.reactivation || !matches!(self.state, AcceptorState::LicensingExchange { .. }) {
+            return None;
+        }
+        if !self
+            .early_capability_flags
+            .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT)
+        {
+            return None;
+        }
+        Some(ConnectTimeAutoDetectWindow {
+            message_channel_id: self.message_channel_id?,
+            user_channel_id: self.user_channel_id,
+        })
     }
 
     pub fn get_result(&mut self) -> Option<AcceptorResult> {
