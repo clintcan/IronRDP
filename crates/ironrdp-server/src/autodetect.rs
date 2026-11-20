@@ -93,6 +93,14 @@ pub struct AutoDetectManager {
     /// response alone must not re-arm reporting of a bandwidth figure that may
     /// be several measurements stale.
     bandwidth_is_fresh: bool,
+    /// (macrdp divergence 35) Bandwidth from this connection's connect-time
+    /// measurement, which sends a dedicated payload burst. Reported in every
+    /// Network Characteristics Result in preference to `bandwidth_kbps`: the
+    /// continuous measurement counts only the
+    /// ordinary traffic between Start and Stop, so on a server that sends less
+    /// than the link can carry it reports the send rate, and a client then warns
+    /// that the network is slow when it isn't.
+    connect_time_bandwidth_kbps: Option<u32>,
 }
 
 /// Result of [`AutoDetectManager::handle_response()`].
@@ -116,6 +124,9 @@ enum PendingBandwidth {
     Open { sequence: u16, ticks_remaining: u32 },
     /// Stop has been sent; awaiting the client's Bandwidth Measure Results.
     AwaitingResults { sequence: u16 },
+    /// (macrdp divergence 35) The connect-time Start, payloads and Stop have
+    /// been sent; awaiting the client's connect-time Bandwidth Measure Results.
+    ConnectTime { sequence: u16 },
 }
 
 impl AutoDetectManager {
@@ -131,7 +142,46 @@ impl AutoDetectManager {
             rtt_is_fresh: false,
             bandwidth_is_fresh: false,
             min_rtt_ms: None,
+            connect_time_bandwidth_kbps: None,
         }
+    }
+
+    /// (macrdp divergence 35) The RTT Measure Request of Optional Connect-Time
+    /// Auto-Detection ([MS-RDPBCGR] 1.3.8, request type 0x1001). Recorded like a
+    /// continuous probe, so [`handle_response()`](Self::handle_response) measures
+    /// the reply the same way.
+    pub fn connect_time_rtt_request(&mut self, now_ms: u64) -> AutoDetectRequest {
+        let seq = self.next_sequence;
+        self.next_sequence = seq.wrapping_add(1);
+        self.pending_probes.push((seq, now_ms));
+        AutoDetectRequest::rtt_connect_time(seq)
+    }
+
+    /// (macrdp divergence 35) Open the connect-time bandwidth transaction and
+    /// return its sequence number and Bandwidth Measure Start (0x1014). The
+    /// caller sends the Start, the payloads and the Stop with that sequence
+    /// number, then passes the client's Bandwidth Measure Results to
+    /// [`handle_response()`](Self::handle_response). If none arrives, it calls
+    /// [`abandon_connect_time_bandwidth()`](Self::abandon_connect_time_bandwidth)
+    /// so the continuous measurement isn't blocked behind it.
+    pub fn connect_time_bandwidth_start(&mut self) -> (u16, AutoDetectRequest) {
+        let seq = self.next_sequence;
+        self.next_sequence = seq.wrapping_add(1);
+        self.pending_bw = Some(PendingBandwidth::ConnectTime { sequence: seq });
+        (seq, AutoDetectRequest::bw_start_connect_time(seq))
+    }
+
+    /// (macrdp divergence 35) The client didn't answer the connect-time
+    /// bandwidth transaction: drop it.
+    pub fn abandon_connect_time_bandwidth(&mut self) {
+        if matches!(self.pending_bw, Some(PendingBandwidth::ConnectTime { .. })) {
+            self.pending_bw = None;
+        }
+    }
+
+    /// (macrdp divergence 35) The connect-time bandwidth, once measured.
+    pub fn connect_time_bandwidth_kbps(&self) -> Option<u32> {
+        self.connect_time_bandwidth_kbps
     }
 
     /// Generate an RTT Measure Request PDU for continuous detection.
@@ -175,7 +225,7 @@ impl AutoDetectManager {
                 *ticks_remaining -= 1;
                 None
             }
-            Some(PendingBandwidth::AwaitingResults { .. }) => None,
+            Some(PendingBandwidth::AwaitingResults { .. } | PendingBandwidth::ConnectTime { .. }) => None,
             None => {
                 self.bw_tick_count = self.bw_tick_count.wrapping_add(1);
                 if !self.bw_tick_count.is_multiple_of(BW_MEASURE_INTERVAL_TICKS) {
@@ -229,7 +279,8 @@ impl AutoDetectManager {
         if !self.rtt_is_fresh && !self.bandwidth_is_fresh {
             return None;
         }
-        let bandwidth_kbps = self.bandwidth_kbps?;
+        // (macrdp divergence 35) The connect-time figure wins; see the field.
+        let bandwidth_kbps = self.connect_time_bandwidth_kbps.or(self.bandwidth_kbps)?;
         let base_rtt_ms = self.min_rtt_ms?;
         let snapshot = self.snapshot()?;
 
@@ -287,14 +338,22 @@ impl AutoDetectManager {
                 AutoDetectOutcome::Rtt(rtt_ms)
             }
             AutoDetectResponse::BandwidthMeasureResults { sequence_number, .. } => {
-                let awaiting = matches!(
+                let connect_time = matches!(
                     self.pending_bw,
-                    Some(PendingBandwidth::AwaitingResults { sequence }) if sequence == *sequence_number
+                    Some(PendingBandwidth::ConnectTime { sequence }) if sequence == *sequence_number
                 );
+                let awaiting = connect_time
+                    || matches!(
+                        self.pending_bw,
+                        Some(PendingBandwidth::AwaitingResults { sequence }) if sequence == *sequence_number
+                    );
                 if !awaiting {
                     return AutoDetectOutcome::Unmatched;
                 }
                 self.pending_bw = None;
+                if connect_time {
+                    self.connect_time_bandwidth_kbps = response.computed_bandwidth_kbps();
+                }
                 // A transaction that completes without a usable figure clears the
                 // previous one rather than leaving it in place, so a run of failures
                 // withholds the result (see `build_netchar_result`) instead of
@@ -387,4 +446,134 @@ pub struct RttSnapshot {
     pub avg_ms: u32,
     /// Number of samples in the current window.
     pub sample_count: usize,
+}
+
+// (macrdp divergence 35) The connect-time measurement and the bandwidth later
+// results report. Upstream's own AutoDetectManager tests live in
+// ironrdp-testsuite-core; these cover only what the divergence adds.
+#[cfg(test)]
+mod connect_time_tests {
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS, RTT_REQUEST_CONNECT_TIME,
+    };
+
+    use super::{AutoDetectManager, AutoDetectOutcome};
+
+    fn results(sequence_number: u16, response_type: u16, kbps: u32) -> AutoDetectResponse {
+        // byte_count * 8 / time_delta_ms = kbps, over a one-second window.
+        AutoDetectResponse::BandwidthMeasureResults {
+            sequence_number,
+            response_type,
+            time_delta_ms: 1000,
+            byte_count: kbps * 1000 / 8,
+        }
+    }
+
+    fn reported_bandwidth(result: Option<AutoDetectRequest>) -> Option<u32> {
+        match result? {
+            AutoDetectRequest::NetworkCharacteristicsResult { bandwidth_kbps, .. } => bandwidth_kbps,
+            _ => None,
+        }
+    }
+
+    /// Connect-time RTT and bandwidth complete, and the Network
+    /// Characteristics Result reports the connect-time bandwidth.
+    #[test]
+    fn connect_time_measurement_feeds_the_result() {
+        let mut ad = AutoDetectManager::new();
+        let AutoDetectRequest::RttRequest {
+            sequence_number,
+            request_type,
+        } = ad.connect_time_rtt_request(1_000)
+        else {
+            panic!("expected an RTT request");
+        };
+        assert_eq!(request_type, RTT_REQUEST_CONNECT_TIME);
+        assert_eq!(
+            ad.handle_response(&AutoDetectResponse::RttResponse { sequence_number }, 1_003),
+            AutoDetectOutcome::Rtt(3)
+        );
+
+        let (sequence, _start) = ad.connect_time_bandwidth_start();
+        assert_eq!(
+            ad.handle_response(&results(sequence, BW_RESULTS_CONNECT_TIME, 100_000), 1_010),
+            AutoDetectOutcome::Bandwidth(Some(100_000))
+        );
+        assert_eq!(ad.connect_time_bandwidth_kbps(), Some(100_000));
+        assert_eq!(reported_bandwidth(ad.build_netchar_result(1_010)), Some(100_000));
+    }
+
+    /// A later continuous measurement counts only ordinary traffic, so on a
+    /// server sending less than the link carries it comes in low. The results
+    /// keep reporting the connect-time figure, which is what stops the client
+    /// warning that the network is slow.
+    #[test]
+    fn a_lower_continuous_figure_does_not_replace_the_connect_time_one() {
+        let mut ad = AutoDetectManager::new();
+        let (sequence, _start) = ad.connect_time_bandwidth_start();
+        ad.handle_response(&results(sequence, BW_RESULTS_CONNECT_TIME, 100_000), 0);
+        let AutoDetectRequest::RttRequest { sequence_number, .. } = ad.send_rtt_request(0) else {
+            panic!("expected an RTT request");
+        };
+        ad.handle_response(&AutoDetectResponse::RttResponse { sequence_number }, 2);
+
+        // Drive the continuous measurement: Start on the 8th tick, Stop 4 ticks later.
+        let mut start = None;
+        for _ in 0..8 {
+            start = start.or(ad.build_bandwidth_measure());
+        }
+        let Some(AutoDetectRequest::BandwidthMeasureStart { sequence_number, .. }) = start else {
+            panic!("expected a continuous Bandwidth Measure Start");
+        };
+        let mut stop = None;
+        for _ in 0..5 {
+            stop = stop.or(ad.build_bandwidth_measure());
+        }
+        assert!(matches!(stop, Some(AutoDetectRequest::BandwidthMeasureStop { .. })));
+        assert_eq!(
+            ad.handle_response(&results(sequence_number, BW_RESULTS_CONTINUOUS, 3_000), 10),
+            AutoDetectOutcome::Bandwidth(Some(3_000))
+        );
+
+        assert_eq!(reported_bandwidth(ad.build_netchar_result(5_000)), Some(100_000));
+    }
+
+    /// Without a connect-time figure, the continuous one is reported as before.
+    #[test]
+    fn without_a_connect_time_figure_the_continuous_one_is_reported() {
+        let mut ad = AutoDetectManager::new();
+        let (_sequence, _start) = ad.connect_time_bandwidth_start();
+        ad.abandon_connect_time_bandwidth();
+        let AutoDetectRequest::RttRequest { sequence_number, .. } = ad.send_rtt_request(0) else {
+            panic!("expected an RTT request");
+        };
+        ad.handle_response(&AutoDetectResponse::RttResponse { sequence_number }, 2);
+
+        // An abandoned connect-time transaction doesn't block the continuous one.
+        let mut start = None;
+        for _ in 0..8 {
+            start = start.or(ad.build_bandwidth_measure());
+        }
+        let Some(AutoDetectRequest::BandwidthMeasureStart { sequence_number, .. }) = start else {
+            panic!("the continuous measurement never started after the abandon");
+        };
+        for _ in 0..5 {
+            ad.build_bandwidth_measure();
+        }
+        ad.handle_response(&results(sequence_number, BW_RESULTS_CONTINUOUS, 3_000), 10);
+        assert_eq!(ad.connect_time_bandwidth_kbps(), None);
+        assert_eq!(reported_bandwidth(ad.build_netchar_result(5_000)), Some(3_000));
+    }
+
+    /// The connect-time Results don't match a stale sequence number.
+    #[test]
+    fn connect_time_results_must_match_the_sequence() {
+        let mut ad = AutoDetectManager::new();
+        let (sequence, _start) = ad.connect_time_bandwidth_start();
+        assert_eq!(
+            ad.handle_response(&results(sequence.wrapping_add(1), BW_RESULTS_CONNECT_TIME, 1), 0),
+            AutoDetectOutcome::Unmatched
+        );
+        assert_eq!(ad.connect_time_bandwidth_kbps(), None);
+    }
 }
