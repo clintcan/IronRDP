@@ -18,7 +18,9 @@ pub use ironrdp_connector::DesktopSize;
 use ironrdp_pdu::nego;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
-pub use self::connection::{Acceptor, AcceptorResult, AcceptorState, MultitransportSecurityRng};
+pub use self::connection::{
+    Acceptor, AcceptorResult, AcceptorState, ConnectTimeAutoDetectWindow, MultitransportSecurityRng,
+};
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
 
@@ -114,15 +116,40 @@ where
 /// after `multitransport_request()` returned `Some`, which the two methods'
 /// own contract does not allow.
 pub async fn accept_finalize_with_multitransport<S, H>(
-    mut framed: Framed<S>,
+    framed: Framed<S>,
     acceptor: &mut Acceptor,
-    mut multitransport_handler: H,
+    multitransport_handler: H,
 ) -> ConnectorResult<(Framed<S>, AcceptorResult)>
 where
     S: FramedRead + FramedWrite,
     H: AsyncFnMut(ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu, bool),
 {
+    accept_finalize_with_hooks(framed, acceptor, multitransport_handler, async |_, _| Ok(())).await
+}
+
+/// (macrdp divergence 7) [`accept_finalize_with_multitransport`], and also
+/// calls `autodetect_handler` once, at the window for Optional Connect-Time
+/// Auto-Detection ([`Acceptor::connect_time_autodetect_window`]): after the
+/// Client Info PDU, before the acceptor sends its first licensing PDU. The
+/// handler may exchange auto-detect PDUs with the client on `framed`; it runs
+/// inside this future, so any timeout the caller puts around the finalize
+/// sequence bounds it too. An error from the handler ends the sequence.
+pub async fn accept_finalize_with_hooks<S, H, A>(
+    mut framed: Framed<S>,
+    acceptor: &mut Acceptor,
+    mut multitransport_handler: H,
+    mut autodetect_handler: A,
+) -> ConnectorResult<(Framed<S>, AcceptorResult)>
+where
+    S: FramedRead + FramedWrite,
+    H: AsyncFnMut(ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu, bool),
+    A: AsyncFnMut(&mut Framed<S>, ConnectTimeAutoDetectWindow) -> ConnectorResult<()>,
+{
     let mut buf = WriteBuf::new();
+    // At most once per call: a deactivation-reactivation never opens the
+    // window (see `connect_time_autodetect_window`), so this only guards
+    // against the acceptor staying in the window across loop iterations.
+    let mut autodetect_done = false;
     // `multitransport_request()` borrows rather than consumes (the field it
     // reads also gates `CapabilitiesWaitConfirm`'s tolerance for a late
     // Initiate Multitransport Response), so this driver tracks locally
@@ -139,6 +166,11 @@ where
     loop {
         if let Some(result) = acceptor.get_result() {
             return Ok((framed, result));
+        }
+
+        if !autodetect_done && let Some(window) = acceptor.connect_time_autodetect_window() {
+            autodetect_done = true;
+            autodetect_handler(&mut framed, window).await?;
         }
 
         single_sequence_step(&mut framed, acceptor, &mut buf).await?;
