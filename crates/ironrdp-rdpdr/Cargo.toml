@@ -23,6 +23,3 @@ ironrdp-svc = { path = "../ironrdp-svc", version = "0.8" } # public
 tracing = { version = "0.1", features = ["log"] }
 bitflags = "2.11"
 getrandom = { version = "0.3", features = ["std"] }
-
-[lints]
-workspace = true
