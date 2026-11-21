@@ -7076,7 +7076,11 @@ impl RdpServer {
             // called, see `PendingConnection::new`), so the handler below
             // simply never runs and this is exactly `accept_finalize`'s own
             // behavior.
-            let finalize = ironrdp_acceptor::accept_finalize_with_handlers(
+            // (macrdp 35) `_with_hooks`: the connect-time auto-detect runs
+            // inside this future, so FINALIZE_TIMEOUT bounds it too. It only
+            // runs when auto-detect is enabled and the client opened the window.
+            let autodetect = &mut conn.autodetect;
+            let finalize = ironrdp_acceptor::accept_finalize_with_hooks(
                 framed,
                 &mut acceptor,
                 self,
@@ -7093,6 +7097,8 @@ impl RdpServer {
                         multitransport::accept(udp_bind_addr, tls_config, &request).await
                     }));
                 },
+                // (macrdp 35)
+                async |framed, window| macrdp::connect_time_autodetect_hook(framed, window, autodetect.as_mut()).await,
             );
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
                 Ok(res) => res.map_err_kind("failed to accept client during finalize", ServerErrorKind::Connector)?,

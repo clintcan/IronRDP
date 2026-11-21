@@ -7,21 +7,24 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ironrdp_acceptor::AcceptorResult;
+use ironrdp_async::Framed;
 use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
 use ironrdp_pdu::rdp::client_info::ClientAutoReconnect;
+use ironrdp_pdu::{mcs, rdp};
 use ironrdp_svc::server_encode_svc_messages;
-use ironrdp_tokio::FramedWrite as _;
+use ironrdp_tokio::{FramedRead, FramedWrite};
 use rdpsnd::server::RdpsndServer;
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use super::{
-    ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, SharedConnectionHandler, WriteCompletion, rdpsnd,
-    with_connection_handler,
+    ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, SharedConnectionHandler, WriteCompletion,
+    encode_autodetect_request, monotonic_now_ms, rdpsnd, with_connection_handler,
 };
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
 use crate::audin::AudinChannelFactory;
+use crate::autodetect::{AutoDetectManager, AutoDetectOutcome};
 use crate::rdcamera::RdCameraChannelFactory;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
 use crate::rdpeusb::UrbdrcChannelFactory;
@@ -604,6 +607,201 @@ pub(super) fn prioritize_batch(events: &mut [ServerEvent]) {
     if has_egfx && events.iter().any(|e| tier(e) != 1) {
         // `sort_by_key` is stable.
         events.sort_by_key(tier);
+    }
+}
+
+/// (macrdp 35) How long the connect-time auto-detect waits for each
+/// reply (the RTT Measure Response, the Bandwidth Measure Results). A client
+/// that doesn't answer still logs on; the wait only delays it.
+const CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(2);
+
+/// (macrdp 35) The connect-time bandwidth burst: this many Bandwidth
+/// Measure Payload PDUs of [`CONNECT_TIME_BW_PAYLOAD_LEN`] bytes (256 KiB). Each
+/// PDU stays below 16 KiB of MCS user data, because the PER length encoding
+/// here has no fragmentation and mstsc rejected 16 KiB payloads with 0x1304
+/// (found in clintcan/macrdp#235).
+const CONNECT_TIME_BW_PAYLOADS: usize = 32;
+const CONNECT_TIME_BW_PAYLOAD_LEN: usize = 8 * 1024;
+
+/// (macrdp 35) The connect-time auto-detect hook of the finalize loop, called by
+/// `ironrdp_acceptor::accept_finalize_with_hooks` at the acceptor's window.
+/// Runs [`connect_time_autodetect`] only when auto-detect is enabled (`ad` is
+/// the connection's manager).
+pub(super) async fn connect_time_autodetect_hook<S>(
+    framed: &mut Framed<S>,
+    window: ironrdp_acceptor::ConnectTimeAutoDetectWindow,
+    ad: Option<&mut AutoDetectManager>,
+) -> ironrdp_connector::ConnectorResult<()>
+where
+    S: FramedRead + FramedWrite,
+{
+    if let Some(ad) = ad {
+        connect_time_autodetect(framed, window, ad)
+            .await
+            .map_err(|e| ironrdp_connector::custom_err!("connect-time auto-detect", e))?;
+    }
+    Ok(())
+}
+
+/// (macrdp 35) Optional Connect-Time Auto-Detection ([MS-RDPBCGR]
+/// 1.3.8), run in the acceptor's window between Client Info and licensing (see
+/// `ironrdp_acceptor::accept_finalize_with_hooks`): an RTT Measure Request, then
+/// a Bandwidth Measure Start, a 256 KiB payload burst and a Stop, then a Network
+/// Characteristics Result. The bandwidth measured here is what later results
+/// report (see `AutoDetectManager::connect_time_bandwidth_kbps`).
+///
+/// Starts the connection with a fresh `AutoDetectManager`, so no figure from a
+/// previous client is reported to this one. Each reply is awaited for at most
+/// [`CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT`]. Anything else the client sends in
+/// this window is skipped, not treated as an error: the measurement may only
+/// ever delay a logon, never fail it. Only a failed write (the connection is
+/// gone) is an error.
+async fn connect_time_autodetect<S>(
+    framed: &mut Framed<S>,
+    window: ironrdp_acceptor::ConnectTimeAutoDetectWindow,
+    ad: &mut AutoDetectManager,
+) -> ServerResult<()>
+where
+    S: FramedRead + FramedWrite,
+{
+    *ad = AutoDetectManager::new();
+    let channel = window.message_channel_id;
+    let user = window.user_channel_id;
+    // `Ok(false)`: the request couldn't be encoded, so the measurement is
+    // skipped (logged); the logon goes on. Only a failed write is an error.
+    let send = async |framed: &mut Framed<S>, request| -> ServerResult<bool> {
+        let data = match encode_autodetect_request(request, channel, user) {
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "Connect-time auto-detect: could not encode a request, skipping the measurement");
+                return Ok(false);
+            }
+        };
+        framed
+            .write_all(&data)
+            .await
+            .map_err(|e| ServerError::io("connect-time auto-detect write", e))?;
+        Ok(true)
+    };
+
+    let rtt_request = ad.connect_time_rtt_request(monotonic_now_ms());
+    if !send(framed, rtt_request).await? {
+        return Ok(());
+    }
+    let rtt = await_autodetect_reply(framed, channel, ad, |o| matches!(o, AutoDetectOutcome::Rtt(_))).await;
+
+    let (sequence, start) = ad.connect_time_bandwidth_start();
+    if !send(framed, start).await? {
+        ad.abandon_connect_time_bandwidth();
+        return Ok(());
+    }
+    // Not all-zero, so a compressing transport can't shrink the burst; the
+    // content itself doesn't matter.
+    let mut state = monotonic_now_ms() | 1;
+    let mut filler = move || {
+        let mut bytes = vec![0u8; CONNECT_TIME_BW_PAYLOAD_LEN];
+        for chunk in bytes.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        bytes
+    };
+    for _ in 0..CONNECT_TIME_BW_PAYLOADS {
+        if !send(
+            framed,
+            rdp::autodetect::AutoDetectRequest::bw_payload(sequence, filler()),
+        )
+        .await?
+        {
+            ad.abandon_connect_time_bandwidth();
+            return Ok(());
+        }
+    }
+    // The connect-time Stop (0x002B) must carry a payload ([MS-RDPBCGR]
+    // 2.2.14.1.4; IronRDP refuses to encode an empty one); a few bytes do.
+    let mut stop_payload = filler();
+    stop_payload.truncate(4);
+    if !send(
+        framed,
+        rdp::autodetect::AutoDetectRequest::bw_stop_connect_time(sequence, stop_payload),
+    )
+    .await?
+    {
+        ad.abandon_connect_time_bandwidth();
+        return Ok(());
+    }
+    let bandwidth = await_autodetect_reply(framed, channel, ad, |o| matches!(o, AutoDetectOutcome::Bandwidth(_))).await;
+    if bandwidth.is_none() {
+        ad.abandon_connect_time_bandwidth();
+    }
+
+    if let Some(result) = ad.build_netchar_result(monotonic_now_ms()) {
+        // A result that can't be encoded is just not sent.
+        send(framed, result).await?;
+    }
+    info!(
+        rtt_ms = ?rtt.and_then(|o| match o {
+            AutoDetectOutcome::Rtt(ms) => Some(ms),
+            _ => None,
+        }),
+        bandwidth_kbps = ?ad.connect_time_bandwidth_kbps(),
+        "Connect-time auto-detect done"
+    );
+    Ok(())
+}
+
+/// (macrdp 35) Read frames until an Auto-Detect Response on the
+/// message channel produces an outcome `done` accepts, or
+/// [`CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT`] passes. Returns `None` on timeout
+/// or a read error. Other frames are skipped (see [`connect_time_autodetect`]).
+async fn await_autodetect_reply<S>(
+    framed: &mut Framed<S>,
+    message_channel_id: u16,
+    ad: &mut AutoDetectManager,
+    done: impl Fn(AutoDetectOutcome) -> bool,
+) -> Option<AutoDetectOutcome>
+where
+    S: FramedRead,
+{
+    // Local: imported at module level they would make the tests' qualified
+    // paths (through `use super::*`) unnecessary qualifications.
+    use ironrdp_core::decode;
+    use ironrdp_pdu::x224::X224;
+
+    let deadline = tokio::time::Instant::now() + CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT;
+    loop {
+        let (_action, frame) = match tokio::time::timeout_at(deadline, framed.read_pdu()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => {
+                debug!(%error, "Connect-time auto-detect: read failed");
+                return None;
+            }
+            Err(_) => {
+                debug!("Connect-time auto-detect: no reply in time, continuing the logon");
+                return None;
+            }
+        };
+        let Ok(X224(mcs::McsMessage::SendDataRequest(data))) = decode::<X224<mcs::McsMessage<'_>>>(&frame) else {
+            debug!("Connect-time auto-detect: skipping a frame that isn't an MCS Send Data Request");
+            continue;
+        };
+        if data.channel_id != message_channel_id {
+            debug!(
+                channel_id = data.channel_id,
+                "Connect-time auto-detect: skipping a frame on another channel"
+            );
+            continue;
+        }
+        let Ok(pdu) = decode::<rdp::autodetect::AutoDetectRspPdu>(data.user_data.as_ref()) else {
+            debug!("Connect-time auto-detect: skipping a message-channel PDU that isn't an Auto-Detect Response");
+            continue;
+        };
+        let outcome = ad.handle_response(&pdu.response, monotonic_now_ms());
+        if done(outcome) {
+            return Some(outcome);
+        }
     }
 }
 
