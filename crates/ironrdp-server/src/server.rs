@@ -5111,6 +5111,9 @@ impl RdpServer {
                 })
                 .count()
         };
+        // (macrdp 4) CLIPRDR first, RDPDR last.
+        #[cfg(feature = "egfx")]
+        macrdp::prioritize_batch(events);
         let mut pending = core::mem::take(events).into_iter();
         while let Some(event) = pending.next() {
             // Validity-guarded stateful events and audio waves wait for earlier queued writes to finish so a stale

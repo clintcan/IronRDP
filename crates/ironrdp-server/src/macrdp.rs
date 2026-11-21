@@ -11,6 +11,8 @@ use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 
 use super::{ConnectionState, QueuedWriter, RdpServer, WriteCompletion, rdpsnd};
+#[cfg(feature = "egfx")]
+use crate::ServerEvent;
 use crate::{AudioWave, ServerError, ServerErrorExt as _, ServerResult};
 
 /// (macrdp) Per-server state for macrdp's divergences, in one `RdpServer` field.
@@ -218,11 +220,48 @@ impl AudioLagModel {
     }
 }
 
+/// (macrdp 4) Reorders one event batch into three tiers: CLIPRDR, then EGFX
+/// video and everything else, then RDPDR, since all of them share the one
+/// outbound queue.
+///
+/// - CLIPRDR first: with H.264 on, a small FileContentsResponse otherwise queues
+///   behind dozens of large video frames every batch, throttling a Mac-to-Windows
+///   file copy to a crawl and freezing Explorer's synchronous paste read.
+/// - RDPDR last: a large drive write (copying TO the redirected drive) otherwise
+///   holds the writer ahead of the video frames in the same batch and stutters video.
+///
+/// Stable within each tier, so H.264 frames keep their order for the inter-frame
+/// chain. CLIPRDR and RDPDR ride their own channels, so reordering them against EGFX
+/// breaks no on-wire ordering. Audio from the audio channel is not in the batch: it
+/// ships per wave from the client loop's audio arm, keeping its natural cadence.
+#[cfg(feature = "egfx")]
+pub(super) fn prioritize_batch(events: &mut [ServerEvent]) {
+    fn tier(event: &ServerEvent) -> u8 {
+        match event {
+            // All three clipboard variants share tier 0, so the stable sort keeps their
+            // order on the CLIPRDR channel.
+            ServerEvent::Clipboard(_)
+            | ServerEvent::ClipboardWithCompletion(..)
+            | ServerEvent::ClipboardWithValidity { .. } => 0,
+            ServerEvent::Rdpdr(_) => 2,
+            _ => 1,
+        }
+    }
+    let has_egfx = events.iter().any(|e| matches!(e, ServerEvent::Egfx(_)));
+    if has_egfx && events.iter().any(|e| tier(e) != 1) {
+        // `sort_by_key` is stable.
+        events.sort_by_key(tier);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
 
     use super::*;
+    // Imported above only with `egfx`.
+    #[cfg(not(feature = "egfx"))]
+    use crate::ServerEvent;
 
     #[tokio::test]
     async fn the_next_wave_waits_until_the_previous_one_is_written() {
@@ -288,7 +327,7 @@ mod tests {
         type Slot = Arc<std::sync::Mutex<Option<mpsc::Sender<AudioWave>>>>;
         struct KeepSender(Slot);
         impl crate::ServerEventSender for KeepSender {
-            fn set_sender(&mut self, _sender: mpsc::UnboundedSender<crate::ServerEvent>) {}
+            fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {}
         }
         impl crate::SoundServerFactory for KeepSender {
             fn build_backend(&self) -> Box<dyn crate::RdpsndServerHandler> {
@@ -386,5 +425,71 @@ mod tests {
         }
         // 250 ms deficit + 200 ms budget = 22.5 waves of 20 ms.
         assert_eq!(admitted, 22);
+    }
+
+    #[cfg(feature = "egfx")]
+    mod batch_priority {
+        use ironrdp_cliprdr::backend::ClipboardMessage;
+        use ironrdp_rdpdr::server::RdpdrServerMessage;
+
+        use super::*;
+        use crate::EgfxServerMessage;
+
+        fn egfx(n: usize) -> ServerEvent {
+            ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: Vec::with_capacity(n),
+            })
+        }
+
+        fn label(event: &ServerEvent) -> String {
+            match event {
+                ServerEvent::Clipboard(_) => "clip".to_owned(),
+                ServerEvent::Rdpdr(_) => "rdpdr".to_owned(),
+                ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) => {
+                    format!("egfx{}", messages.capacity())
+                }
+                ServerEvent::LogonCompleted => "other".to_owned(),
+                _ => unreachable!(),
+            }
+        }
+
+        fn rdpdr() -> ServerEvent {
+            ServerEvent::Rdpdr(RdpdrServerMessage::Close {
+                device_id: 1,
+                file_id: 1,
+            })
+        }
+
+        fn clip() -> ServerEvent {
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(Vec::new()))
+        }
+
+        #[test]
+        fn a_batch_with_egfx_goes_cliprdr_first_and_rdpdr_last() {
+            let mut events = vec![
+                rdpdr(),
+                egfx(1),
+                clip(),
+                ServerEvent::LogonCompleted,
+                egfx(2),
+                rdpdr(),
+                egfx(3),
+                clip(),
+            ];
+            prioritize_batch(&mut events);
+            let order: Vec<_> = events.iter().map(label).collect();
+            assert_eq!(
+                order,
+                ["clip", "clip", "egfx1", "other", "egfx2", "egfx3", "rdpdr", "rdpdr"]
+            );
+        }
+
+        #[test]
+        fn a_batch_without_egfx_keeps_its_order() {
+            let mut events = vec![rdpdr(), clip(), ServerEvent::LogonCompleted];
+            prioritize_batch(&mut events);
+            let order: Vec<_> = events.iter().map(label).collect();
+            assert_eq!(order, ["rdpdr", "clip", "other"]);
+        }
     }
 }
