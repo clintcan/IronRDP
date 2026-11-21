@@ -3603,6 +3603,7 @@ dependencies = [
 name = "ironrdp-server"
 version = "0.14.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytes",
  "ironrdp-acceptor",

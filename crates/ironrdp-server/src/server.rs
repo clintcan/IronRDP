@@ -87,6 +87,7 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 // reaches `RdpServer`'s private fields without widening them.
 #[path = "macrdp.rs"]
 mod macrdp;
+pub(crate) use macrdp::MacrdpChannelFactories;
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
@@ -1834,6 +1835,8 @@ pub enum ServerEvent {
     AutoDetectRttRequest,
     #[cfg(feature = "usb")]
     Usb(UrbdrcServerMessage),
+    /// (macrdp 11) macrdp's own RDPDR drive + smart card channel.
+    RdpdrDrive(crate::RdpdrDriveMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1894,6 +1897,8 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+            // (macrdp 11)
+            Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
         }
     }
 }
@@ -5838,6 +5843,10 @@ impl RdpServer {
                                 .map_err(|e| ServerError::io("write_all", e))?;
                         }
                     }
+                }
+                // (macrdp 11) macrdp's RDPDR device-I/O requests: see `macrdp::dispatch_rdpdr_drive`.
+                ServerEvent::RdpdrDrive(message) => {
+                    macrdp::dispatch_rdpdr_drive(conn, writer, user_channel_id, message).await?;
                 }
             }
         }

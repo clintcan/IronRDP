@@ -4,6 +4,10 @@
 
 mod macros;
 
+// (macrdp) macrdp's own channel modules, kept alongside upstream's
+// equivalents (which stay inert: macrdp never sets their factories).
+mod rdpdr_drive;
+
 pub mod autodetect;
 mod builder;
 mod capabilities;
@@ -49,6 +53,11 @@ pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
 pub use ironrdp_rdpeusb::io::{CompletionData, DeviceText, InternalIoControlPacket};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
+pub use rdpdr_drive::{
+    AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory,
+    RdpdrHandle, RdpdrServerHandler, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD,
+    SCARD_SHARE_DIRECT, SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
+};
 pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
 pub use rdpei::{
     CsReadyFlags, CsReadyPdu, DismissHoveringTouchContactPdu, PenContact, PenContactDataFlags, PenContactFields,
