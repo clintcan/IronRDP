@@ -318,10 +318,6 @@ fn tunnel_name(tunnel: SoftSyncTunnelType) -> &'static str {
 
 // ---- Configuration (macrdp calls these once, at startup) ----
 
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "macrdp's methods stay out of server.rs so the fork's hooks there stay small"
-)]
 impl RdpServer {
     /// Never set together with upstream's `with_udp_transport`: both would offer UDP
     /// to the same connection.
@@ -481,10 +477,6 @@ impl RdpServer {
     }
 }
 
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "macrdp's methods stay out of server.rs so the fork's hooks there stay small"
-)]
 impl ConnectionState {
     /// After a finalize pass: record the request the acceptor sent, so the client's
     /// response can be matched and Soft-Sync fired once its tunnel binds.
