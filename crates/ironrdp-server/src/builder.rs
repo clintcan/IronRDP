@@ -303,6 +303,13 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// (macrdp 19) Configure server-direction MS-RDPECAM (camera
+    /// redirection). When set, the `RDCamera_Device_Enumerator` DVC is advertised.
+    pub fn with_camera_factory(mut self, factory: Option<Box<dyn crate::RdCameraServerFactory>>) -> Self {
+        self.state.macrdp_channels.camera = factory;
+        self
+    }
+
     /// Configure MS-RDPEAI (audio input / microphone redirection over a dynamic channel).
     pub fn with_rdpeai_factory(mut self, rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>) -> Self {
         self.state.rdpeai_factory = rdpeai_factory;

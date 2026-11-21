@@ -18,11 +18,12 @@ use super::{
 };
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
+use crate::rdcamera::RdCameraChannelFactory;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
 use crate::rdpeusb::UrbdrcChannelFactory;
 use crate::{
-    AudioWave, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory, ServerError, ServerErrorExt as _,
-    ServerResult, UrbdrcServerFactory, UrbdrcServerMessage,
+    AudioWave, RdCameraServerFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory, ServerError,
+    ServerErrorExt as _, ServerResult, UrbdrcServerFactory, UrbdrcServerMessage,
 };
 
 // (macrdp 12) macrdp's UDP multitransport, under this module so it can extend
@@ -61,6 +62,8 @@ pub(crate) struct MacrdpChannelFactories {
     pub(crate) rdpdr_drive: Option<Box<dyn RdpdrDriveServerFactory>>,
     /// (macrdp 16) Never set together with upstream's `with_usb_factory`.
     pub(crate) urbdrc: Option<Box<dyn UrbdrcServerFactory>>,
+    /// (macrdp 19) MS-RDPECAM camera redirection; upstream has no server wiring for it.
+    pub(crate) camera: Option<Box<dyn RdCameraServerFactory>>,
 }
 
 /// (macrdp 2) Bounded to ~1 s of audio at the steady-state 42.78 waves/s
@@ -104,6 +107,12 @@ impl RdpServer {
             urbdrc.set_sender(self.ev_sender.clone());
             self.dynamic_channel_factories
                 .push(Box::new(UrbdrcChannelFactory::new(urbdrc)));
+        }
+        // (macrdp 19) The camera enumerator, after URBDRC as before.
+        if let Some(mut camera) = channels.camera {
+            camera.set_sender(self.ev_sender.clone());
+            self.dynamic_channel_factories
+                .push(Box::new(RdCameraChannelFactory::new(camera)));
         }
         // No sound factory: no rdpsnd channel, so no audio arm.
         if let Some(snd) = self.sound_factory.as_mut() {
@@ -683,6 +692,166 @@ mod tests {
             )
             .unwrap();
             expected.extend(server_encode_svc_messages(transfer, DRDYNVC_CHANNEL_ID, USER_CHANNEL_ID).unwrap());
+            let written: Vec<u8> = queue
+                .pending
+                .borrow()
+                .iter()
+                .flat_map(|pdu| pdu.bytes.iter().copied())
+                .collect();
+            assert_eq!(written, expected);
+        }
+    }
+
+    mod camera {
+        use core::any::TypeId;
+        use std::rc::Rc;
+
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::DrdynvcServer;
+        use ironrdp_dvc::pdu::{
+            CapabilitiesResponsePdu, CapsVersion, CreateRequestPdu, CreateResponsePdu, CreationStatus, DataPdu,
+            DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu,
+        };
+        use ironrdp_svc::{ChannelFlags, SvcMessage, SvcProcessor as _};
+
+        use super::super::super::OutboundQueue;
+        use super::*;
+        use crate::{RdCameraServer, UrbdrcServer};
+
+        const DRDYNVC_CHANNEL_ID: u16 = 1005;
+        const USER_CHANNEL_ID: u16 = 1002;
+
+        struct Camera {
+            sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+            sinks: Arc<AtomicU32>,
+        }
+
+        impl crate::ServerEventSender for Camera {
+            fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+                self.sender = Some(sender);
+            }
+        }
+
+        impl RdCameraServerFactory for Camera {
+            fn build_processor(&self) -> RdCameraServer {
+                RdCameraServer::with_sender(self.sender.clone())
+            }
+
+            fn build_sample_sink(&self) -> Option<Box<dyn crate::CameraSampleSink>> {
+                self.sinks.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+
+        struct Usb;
+
+        impl crate::ServerEventSender for Usb {
+            fn set_sender(&mut self, _: mpsc::UnboundedSender<ServerEvent>) {}
+        }
+
+        impl UrbdrcServerFactory for Usb {
+            fn build_processor(&self) -> UrbdrcServer {
+                UrbdrcServer::new()
+            }
+        }
+
+        fn server(sinks: &Arc<AtomicU32>) -> RdpServer {
+            RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .with_urbdrc_factory(Some(Box::new(Usb)))
+                .with_camera_factory(Some(Box::new(Camera {
+                    sender: None,
+                    sinks: Arc::clone(sinks),
+                })))
+                .build()
+        }
+
+        fn open_all(drdynvc: &mut DrdynvcServer, creates: Vec<SvcMessage>) {
+            for create in creates {
+                let DrdynvcServerPdu::Create(create) =
+                    ironrdp_core::decode::<DrdynvcServerPdu>(&create.encode_unframed_pdu().unwrap()).unwrap()
+                else {
+                    panic!("expected a Create Request");
+                };
+                let response = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+                    create.channel_id(),
+                    CreationStatus::OK,
+                )))
+                .unwrap();
+                drdynvc.process(&response).unwrap();
+            }
+        }
+
+        #[test]
+        fn the_camera_channel_is_attached_after_urbdrc() {
+            let server = server(&Arc::default());
+            let drdynvc = server
+                .dynamic_channel_factories
+                .iter()
+                .fold(DrdynvcServer::new(), |dvc, factory| factory.attach(dvc));
+            let camera = drdynvc.get_channel_id_by_type::<RdCameraServer>().unwrap();
+            assert!(drdynvc.get_channel_id_by_type::<UrbdrcServer>().unwrap() < camera);
+        }
+
+        #[tokio::test]
+        async fn an_announced_camera_gets_its_own_channel() {
+            let sinks = Arc::new(AtomicU32::new(0));
+            let mut server = server(&sinks);
+            let mut drdynvc = server
+                .dynamic_channel_factories
+                .iter()
+                .fold(DrdynvcServer::new(), |dvc, factory| factory.attach(dvc));
+            drdynvc.start().unwrap();
+            let caps = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+                CapsVersion::V2,
+            )))
+            .unwrap();
+            let creates = drdynvc.process(&caps).unwrap();
+            open_all(&mut drdynvc, creates);
+            let enumerator = drdynvc.get_channel_id_by_type::<RdCameraServer>().unwrap();
+
+            // DEVICE_ADDED_NOTIFICATION: "C\0" in UTF-16LE, then the channel name.
+            let mut added = vec![1, 0x05, b'C', 0, 0, 0];
+            added.extend_from_slice(b"RDCamera_Device_0\0");
+            let added = encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+                enumerator, added,
+            ))))
+            .unwrap();
+            assert!(drdynvc.process(&added).unwrap().is_empty());
+
+            let mut conn = ConnectionState::default();
+            conn.static_channels.insert(drdynvc);
+            conn.static_channels
+                .attach_channel_id(TypeId::of::<DrdynvcServer>(), DRDYNVC_CHANNEL_ID);
+            let mut events = Vec::new();
+            {
+                let mut receiver = server.ev_receiver.lock().await;
+                while let Ok(event) = receiver.try_recv() {
+                    events.push(event);
+                }
+            }
+            assert_eq!(events.len(), 1);
+            assert_eq!(sinks.load(Ordering::Relaxed), 0);
+
+            let queue = Rc::new(OutboundQueue::default());
+            let mut writer = QueuedWriter::new(Rc::clone(&queue));
+            server
+                .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, USER_CHANNEL_ID, None, None)
+                .await
+                .unwrap();
+            // The sink is built once, when the device channel is created.
+            assert_eq!(sinks.load(Ordering::Relaxed), 1);
+
+            // The enumerator is the last channel registered, so the device gets the next id.
+            let create = SvcMessage::from(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                enumerator + 1,
+                "RDCamera_Device_0".into(),
+            )))
+            .with_flags(ChannelFlags::SHOW_PROTOCOL);
+            let expected = server_encode_svc_messages(vec![create], DRDYNVC_CHANNEL_ID, USER_CHANNEL_ID).unwrap();
             let written: Vec<u8> = queue
                 .pending
                 .borrow()
