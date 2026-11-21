@@ -6,11 +6,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use ironrdp_acceptor::AcceptorResult;
+use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
 use ironrdp_svc::server_encode_svc_messages;
 use ironrdp_tokio::FramedWrite as _;
 use rdpsnd::server::RdpsndServer;
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, SharedConnectionHandler, WriteCompletion, rdpsnd,
@@ -488,6 +490,49 @@ pub(super) fn report_authentication(
     });
 }
 
+/// (macrdp 20) Client-fingerprint log: the identity the acceptor captured from
+/// the GCC Client Core Data (acceptor divergence 4) plus the General-capset
+/// platform, logged and passed to
+/// [`ConnectionHandler::on_client_fingerprint`](crate::ConnectionHandler::on_client_fingerprint).
+/// mstsc sends the real Windows build + WINDOWS; FreeRDP hardcodes build 2600; the
+/// Windows Apps announce their host platform. Informational only: a client can
+/// claim anything.
+pub(super) fn report_client_fingerprint(handler: Option<&SharedConnectionHandler>, result: &AcceptorResult) {
+    client_fingerprint(
+        handler,
+        &result.client_name,
+        result.client_version,
+        result.client_build,
+        &result.capabilities,
+    );
+}
+
+fn client_fingerprint(
+    handler: Option<&SharedConnectionHandler>,
+    client_name: &str,
+    client_version: u32,
+    client_build: u32,
+    capabilities: &[CapabilitySet],
+) {
+    let platform = capabilities
+        .iter()
+        .find_map(|c| match c {
+            CapabilitySet::General(g) => Some(format!("{:?}/{:?}", g.major_platform_type, g.minor_platform_type)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    info!(
+        client_name = %client_name,
+        rdp_version = format_args!("{client_version:#x}"),
+        client_build,
+        platform = %platform,
+        "client fingerprint"
+    );
+    with_connection_handler(handler, |h| {
+        h.on_client_fingerprint(client_name, client_version, client_build, &platform);
+    });
+}
+
 /// (macrdp 4) Reorders one event batch into three tiers: CLIPRDR, then EGFX
 /// video and everything else, then RDPDR, since all of them share the one
 /// outbound queue.
@@ -859,6 +904,67 @@ mod tests {
                 .flat_map(|pdu| pdu.bytes.iter().copied())
                 .collect();
             assert_eq!(written, expected);
+        }
+    }
+
+    mod fingerprint {
+        use core::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Mutex as StdMutex;
+
+        use ironrdp_pdu::rdp::capability_sets::{General, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
+
+        use super::*;
+        use crate::ConnectionHandler;
+
+        type Seen = Arc<StdMutex<Vec<(String, u32, u32, String)>>>;
+
+        struct Recorder(Seen);
+
+        impl ConnectionHandler for Recorder {
+            fn on_client_fingerprint(
+                &mut self,
+                client_name: &str,
+                rdp_version: u32,
+                client_build: u32,
+                platform: &str,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((client_name.to_owned(), rdp_version, client_build, platform.to_owned()));
+            }
+        }
+
+        fn handler(seen: &Seen) -> SharedConnectionHandler {
+            let handler: Box<dyn ConnectionHandler> = Box::new(Recorder(Arc::clone(seen)));
+            Rc::new(RefCell::new(handler))
+        }
+
+        #[test]
+        fn the_handler_gets_the_client_s_identity_and_platform() {
+            let seen = Seen::default();
+            let handler = handler(&seen);
+            let general = CapabilitySet::General(General {
+                major_platform_type: MajorPlatformType::WINDOWS,
+                minor_platform_type: MinorPlatformType::WINDOWS_NT,
+                protocol_version: 0x0200,
+                extra_flags: GeneralExtraFlags::empty(),
+                refresh_rect_support: false,
+                suppress_output_support: false,
+            });
+            client_fingerprint(Some(&handler), "pc", 0x0008_0004, 22621, &[general]);
+            client_fingerprint(Some(&handler), "pc", 0x0008_0004, 2600, &[]);
+            client_fingerprint(None, "pc", 0x0008_0004, 2600, &[]);
+
+            let platform = format!("{:?}/{:?}", MajorPlatformType::WINDOWS, MinorPlatformType::WINDOWS_NT);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("pc".to_owned(), 0x0008_0004, 22621, platform),
+                    ("pc".to_owned(), 0x0008_0004, 2600, "unknown".to_owned()),
+                ]
+            );
         }
     }
 

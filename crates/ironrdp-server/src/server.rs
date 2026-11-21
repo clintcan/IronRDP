@@ -442,6 +442,15 @@ pub trait ConnectionHandler: Send {
     fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
         let _ = (success, reason);
     }
+
+    /// (macrdp 20) Called once per connection when the capability
+    /// exchange completes (not on a deactivation–reactivation), carrying the
+    /// client-fingerprint identity: the GCC Client Core Data hostname / raw RDP
+    /// version / build number plus the General-capset platform (formatted).
+    /// Informational fingerprinting: a client can claim anything. Default: no-op.
+    fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
+        let _ = (client_name, rdp_version, client_build, platform);
+    }
 }
 
 /// Outcome of a successful [`CredentialValidator::validate`] call.
@@ -6557,6 +6566,12 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        // (macrdp 20) Before the auto-reconnect and credential checks, so a denied
+        // attempt is fingerprinted too.
+        if !result.reactivation {
+            macrdp::report_client_fingerprint(self.connection_handler.as_ref(), &result);
+        }
 
         let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
             if !self.verify_auto_reconnect_cookie(reconnect) {
