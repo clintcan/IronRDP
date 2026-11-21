@@ -432,6 +432,16 @@ pub trait ConnectionHandler: Send {
         let _ = (peer, duration, error);
         PostConnectionAction::Continue
     }
+
+    /// (macrdp 18) Called once per connection after the CredSSP/NLA
+    /// exchange resolves (only under Hybrid security), including for a preemption
+    /// candidate. `success` is whether the client's credentials validated; `reason`
+    /// is a short error description when they did not (auth did not complete:
+    /// dominated by bad credentials, but also a client abort or a mid-exchange
+    /// transport error). Default: no-op.
+    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        let _ = (success, reason);
+    }
 }
 
 /// Outcome of a successful [`CredentialValidator::validate`] call.
@@ -2059,6 +2069,8 @@ struct ServerCredentialsHandler {
     validator: Option<Arc<dyn CredentialValidator>>,
     require_authenticated: bool,
     authenticated_credentials: Option<Credentials>,
+    /// (macrdp 18) Told the CredSSP outcome in [`complete_security_upgrade`].
+    auth_observer: Option<SharedConnectionHandler>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2949,7 +2961,7 @@ where
         // uses this value in practice.
         let client_name = "rdp-client".to_owned();
 
-        ironrdp_acceptor::accept_credssp_with(
+        let result = ironrdp_acceptor::accept_credssp_with(
             framed,
             acceptor,
             &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
@@ -2958,8 +2970,11 @@ where
             None,
             credentials_handler,
         )
-        .await
-        .map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+        .await;
+        // (macrdp 18) After `mark_security_upgrade_as_done`, so a pre-TLS
+        // negotiation error does not report a failed login.
+        macrdp::report_authentication(credentials_handler.auth_observer.as_ref(), &result);
+        result.map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
     }
 
     Ok(())
@@ -3128,6 +3143,8 @@ struct NegotiationContext {
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     requires_authenticated_credentials: bool,
+    /// (macrdp 18) So a candidate's CredSSP outcome is reported too.
+    connection_handler: Option<SharedConnectionHandler>,
 }
 
 /// Negotiate and authenticate a candidate connection against a cloned `ctx`,
@@ -3168,6 +3185,7 @@ where
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
             require_authenticated: ctx.requires_authenticated_credentials,
+            auth_observer: ctx.connection_handler.clone(), // (macrdp 18)
             ..ServerCredentialsHandler::default()
         },
     );
@@ -4069,6 +4087,7 @@ impl RdpServer {
             display: Arc::clone(&self.display),
             credential_validator: self.credential_validator.clone(),
             requires_authenticated_credentials: self.connection_binder.is_some(),
+            connection_handler: self.connection_handler.clone(), // (macrdp 18)
         }
     }
 
@@ -4297,6 +4316,7 @@ impl RdpServer {
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
                 require_authenticated: self.connection_binder.is_some(),
+                auth_observer: self.connection_handler.clone(), // (macrdp 18)
                 ..ServerCredentialsHandler::default()
             },
         );
@@ -8013,6 +8033,7 @@ mod preempt_tests {
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
             credential_validator: None,
             requires_authenticated_credentials: false,
+            connection_handler: None, // (macrdp 18)
         }
     }
 

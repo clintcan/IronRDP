@@ -12,7 +12,10 @@ use rdpsnd::server::RdpsndServer;
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 
-use super::{ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, WriteCompletion, rdpsnd};
+use super::{
+    ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, SharedConnectionHandler, WriteCompletion, rdpsnd,
+    with_connection_handler,
+};
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
@@ -460,6 +463,22 @@ pub(super) async fn dispatch_urbdrc(
         .map_err(|e| ServerError::io("write_all", e))
 }
 
+/// (macrdp 18) Reports a connection's CredSSP outcome to the handler's
+/// [`ConnectionHandler::on_authenticated`](crate::ConnectionHandler::on_authenticated).
+///
+/// `complete_security_upgrade` calls this for every connection, a preemption
+/// candidate included, because both build their `ServerCredentialsHandler` with the
+/// server's handler as its `auth_observer`.
+pub(super) fn report_authentication(
+    observer: Option<&SharedConnectionHandler>,
+    result: &ironrdp_connector::ConnectorResult<()>,
+) {
+    with_connection_handler(observer, |h| {
+        let reason = result.as_ref().err().map(ToString::to_string);
+        h.on_authenticated(result.is_ok(), reason.as_deref());
+    });
+}
+
 /// (macrdp 4) Reorders one event batch into three tiers: CLIPRDR, then EGFX
 /// video and everything else, then RDPDR, since all of them share the one
 /// outbound queue.
@@ -734,6 +753,193 @@ mod tests {
             // A connection without a sample does not inherit the previous one's.
             serve(&mut server, None).await;
             assert_eq!(cell.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    mod authentication {
+        use core::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Mutex as StdMutex;
+
+        use ironrdp_pdu::nego;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+        use tokio_rustls::rustls;
+
+        use super::super::super::{
+            ConnectionSource, IncomingConnection, NegotiationContext, NextConnection, negotiate_candidate,
+        };
+        use super::*;
+        use crate::{ConnectionHandler, TransportTls};
+
+        type Outcomes = Arc<StdMutex<Vec<(bool, Option<String>)>>>;
+
+        struct Recorder(Outcomes);
+
+        impl ConnectionHandler for Recorder {
+            fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+                self.0
+                    .lock()
+                    .expect("outcomes lock poisoned")
+                    .push((success, reason.map(ToOwned::to_owned)));
+            }
+        }
+
+        struct NoCert;
+
+        impl core::fmt::Debug for NoCert {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("NoCert")
+            }
+        }
+
+        impl rustls::server::ResolvesServerCert for NoCert {
+            fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                None
+            }
+        }
+
+        /// Hybrid security; the TLS acceptor is never used, because the streams
+        /// below are `TransportTls::AlreadyDone`.
+        fn hybrid() -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
+            let config =
+                rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(NoCert));
+            (tokio_rustls::TlsAcceptor::from(Arc::new(config)), vec![0; 32])
+        }
+
+        /// A client that asks for NLA, reads the Connection Confirm, then sends
+        /// junk instead of a TSRequest, so CredSSP fails.
+        async fn client_that_fails_credssp(mut stream: DuplexStream) {
+            let request = nego::ConnectionRequest {
+                nego_data: None,
+                flags: nego::RequestFlags::empty(),
+                protocol: nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX,
+                correlation_info: None,
+            };
+            let bytes = ironrdp_core::encode_vec(&ironrdp_pdu::x224::X224(request)).unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            let mut confirm = [0u8; 64];
+            let n = stream.read(&mut confirm).await.unwrap();
+            assert!(n > 0, "no Connection Confirm");
+            stream.write_all(&[0xff; 8]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            // Keep the read half open until the server gives up.
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+        }
+
+        fn outcomes() -> (Outcomes, Rc<RefCell<Box<dyn ConnectionHandler>>>) {
+            let outcomes = Outcomes::default();
+            let handler: Box<dyn ConnectionHandler> = Box::new(Recorder(Arc::clone(&outcomes)));
+            (outcomes, Rc::new(RefCell::new(handler)))
+        }
+
+        /// So CredSSP reads the client's TSRequest instead of failing at once.
+        fn creds() -> Option<crate::Credentials> {
+            Some(crate::Credentials {
+                username: "user".to_owned(),
+                password: "pass".to_owned(),
+                domain: None,
+            })
+        }
+
+        fn hybrid_ctx(handler: Rc<RefCell<Box<dyn ConnectionHandler>>>) -> NegotiationContext {
+            let (acceptor, pub_key) = hybrid();
+            let mut server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_hybrid(acceptor, pub_key)
+                .with_no_input()
+                .with_no_display()
+                .build();
+            server.set_credentials(creds());
+            let mut ctx = server.negotiation_context();
+            ctx.connection_handler = Some(handler);
+            ctx
+        }
+
+        #[tokio::test]
+        async fn a_candidate_s_failed_credssp_is_reported() {
+            let (outcomes, handler) = outcomes();
+            let ctx = hybrid_ctx(handler);
+            let (stream, client) = tokio::io::duplex(4096);
+            let client = tokio::spawn(client_that_fails_credssp(client));
+
+            let candidate = tokio::time::timeout(
+                Duration::from_secs(5),
+                negotiate_candidate(&ctx, IncomingConnection::new(stream, TransportTls::AlreadyDone, None)),
+            )
+            .await
+            .unwrap();
+            assert!(candidate.is_none());
+            client.await.unwrap();
+
+            let outcomes = outcomes.lock().unwrap();
+            assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+            assert!(!outcomes[0].0);
+            assert!(outcomes[0].1.is_some());
+        }
+
+        #[tokio::test]
+        async fn a_pre_tls_negotiation_error_is_not_a_failed_login() {
+            let (outcomes, handler) = outcomes();
+            let ctx = hybrid_ctx(handler);
+            let (stream, mut client) = tokio::io::duplex(4096);
+            client.write_all(&[0x03, 0x00, 0xff, 0xff, 0x41, 0x41]).await.unwrap();
+            drop(client);
+
+            let candidate = tokio::time::timeout(
+                Duration::from_secs(5),
+                negotiate_candidate(&ctx, IncomingConnection::new(stream, TransportTls::AlreadyDone, None)),
+            )
+            .await
+            .unwrap();
+            assert!(candidate.is_none());
+            assert!(outcomes.lock().unwrap().is_empty());
+        }
+
+        struct ClosedSource;
+
+        #[async_trait::async_trait]
+        impl ConnectionSource for ClosedSource {
+            type Stream = DuplexStream;
+
+            async fn accept(&mut self) -> std::io::Result<Option<IncomingConnection<Self::Stream>>> {
+                Ok(None)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_served_connection_s_failed_credssp_is_reported() {
+            let outcomes = Outcomes::default();
+            let (acceptor, pub_key) = hybrid();
+            let mut server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_hybrid(acceptor, pub_key)
+                .with_no_input()
+                .with_no_display()
+                .with_connection_handler(Some(Box::new(Recorder(Arc::clone(&outcomes)))))
+                .build();
+            server.set_credentials(creds());
+            let (stream, client) = tokio::io::duplex(4096);
+            let client = tokio::spawn(client_that_fails_credssp(client));
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                server.serve_connection(
+                    NextConnection::Incoming(IncomingConnection::new(stream, TransportTls::AlreadyDone, None)),
+                    &mut ClosedSource,
+                ),
+            )
+            .await
+            .unwrap();
+            client.await.unwrap();
+
+            let outcomes = outcomes.lock().unwrap();
+            assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+            assert!(!outcomes[0].0);
         }
     }
 
