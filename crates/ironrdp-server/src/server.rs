@@ -1158,6 +1158,10 @@ pub enum TransportTls {
 /// [`RdpServer::serve`] through a [`ConnectionSource`].
 #[derive(Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "(macrdp 15) link_rtt_ms is macrdp's, not public API"
+)]
 pub struct IncomingConnection<S> {
     /// The accepted stream. Socket options are the source's to set; see
     /// [`RdpServer::run_connection`].
@@ -1181,6 +1185,9 @@ pub struct IncomingConnection<S> {
     /// transport, a Unix path, a vsock port), and this lets the embedder find
     /// its record of it again. The server does not look at it.
     pub tag: u64,
+    /// (macrdp 15) The kernel's accept-time TCP RTT in ms, sampled by
+    /// [`TcpConnectionSource`] while the concrete socket is reachable.
+    pub(crate) link_rtt_ms: Option<u32>,
 }
 
 impl<S> IncomingConnection<S> {
@@ -1207,6 +1214,7 @@ impl<S> IncomingConnection<S> {
             peer,
             local_addr: None,
             tag: 0,
+            link_rtt_ms: None, // (macrdp 15)
         }
     }
 
@@ -1350,10 +1358,14 @@ impl ConnectionSource for TcpConnectionSource {
         if let Err(error) = stream.set_nodelay(true) {
             warn!(?peer, %error, "Failed to set TCP_NODELAY; interactive latency may suffer");
         }
+        // (macrdp 15) Sample the kernel's smoothed TCP RTT while the concrete
+        // socket is reachable: the accept loop is generic over the stream.
+        let link_rtt_ms = macrdp::tcp_srtt_ms(&stream);
         let mut incoming = IncomingConnection::new(stream, TransportTls::Managed, Some(peer));
         if let Ok(local_addr) = incoming.stream.local_addr() {
             incoming = incoming.with_local_addr(local_addr);
         }
+        incoming.link_rtt_ms = link_rtt_ms;
         Ok(Some(incoming))
     }
 }
@@ -2208,6 +2220,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        link_rtt_ms: None, // (macrdp 15)
                     }))
                 }
                 // The stream is already past TLS (terminated at a lower
@@ -2221,6 +2234,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        link_rtt_ms: None, // (macrdp 15)
                     }))
                 }
             },
@@ -2230,6 +2244,7 @@ impl PendingConnection {
                 acceptor,
                 local_addr: None,
                 authenticated_credentials: credentials_handler.authenticated_credentials,
+                link_rtt_ms: None, // (macrdp 15)
             })),
         }
     }
@@ -2246,6 +2261,8 @@ struct NegotiatedConnection<S> {
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
     authenticated_credentials: Option<Credentials>,
+    /// (macrdp 15) The accept-time TCP RTT of a preemption candidate.
+    link_rtt_ms: Option<u32>,
 }
 
 /// A negotiated TCP connection whose session has not started.
@@ -3133,6 +3150,7 @@ where
         peer,
         local_addr,
         tag,
+        link_rtt_ms,
     } = incoming;
     let size = ctx.display.lock().await.size().await;
     let capabilities = capabilities::capabilities(&ctx.opts, size);
@@ -3165,6 +3183,7 @@ where
         Ok(Some(mut negotiated)) => {
             debug!(?peer, "candidate authenticated -- eligible to preempt the live session");
             negotiated.local_addr = local_addr;
+            negotiated.link_rtt_ms = link_rtt_ms; // (macrdp 15)
             Some(AuthenticatedConnection {
                 connection: Box::new(negotiated),
                 peer,
@@ -4297,7 +4316,12 @@ impl RdpServer {
             acceptor,
             local_addr,
             authenticated_credentials,
+            link_rtt_ms,
         } = negotiated;
+        // (macrdp 15) A preemption winner was sampled as a candidate.
+        if let Some(rtt) = link_rtt_ms {
+            self.store_link_rtt(rtt);
+        }
         self.clear_bound_connection();
         let _binding = BoundConnectionGuard {
             display: Arc::clone(&self.bound_display),
@@ -4613,6 +4637,11 @@ impl RdpServer {
             // took the session over. Discard any such leftover before serving
             // it; every other event is put back in order.
             NextConnection::Authenticated(_) => self.discard_stale_session_events().await,
+        }
+        // (macrdp 15) A fresh connection's accept-time TCP RTT, before its offer
+        // is decided (0 = unknown). A winner is stored in `finalize_negotiated`.
+        if let NextConnection::Incoming(incoming) = &connection {
+            self.store_link_rtt(incoming.link_rtt_ms.unwrap_or(0));
         }
         self.clear_bound_connection();
         let mut source_open = true;

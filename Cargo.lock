@@ -3706,6 +3706,7 @@ dependencies = [
  "ironrdp-svc",
  "ironrdp-tokio",
  "ironrdp-usb",
+ "libc",
  "macrdp-rdpeudp",
  "qoicoubeh",
  "rand 0.9.5",
