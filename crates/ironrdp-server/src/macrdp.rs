@@ -2,6 +2,7 @@
 //!
 //! `server.rs` holds only the hooks, each marked `(macrdp N)`.
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,6 +32,8 @@ mod mt_session;
 pub(super) struct MacrdpServerState {
     /// (2/8) Dedicated audio channel, read by the client loop's audio arm.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<AudioWave>>>>,
+    /// (15) Kernel TCP RTT sampled at accept, in ms (0 = unknown).
+    link_rtt_ms: Option<Arc<AtomicU32>>,
     /// (12) macrdp's UDP multitransport: its configuration.
     #[cfg(feature = "multitransport")]
     mt: mt_session::MtState,
@@ -113,6 +116,52 @@ impl RdpServer {
     pub(super) fn macrdp_audio_receiver(&self) -> Option<Arc<Mutex<mpsc::Receiver<AudioWave>>>> {
         self.macrdp.audio_receiver.clone()
     }
+
+    /// (macrdp 15) Install a cell the server fills with each accepted
+    /// connection's kernel-smoothed TCP RTT in ms (0 = unknown).
+    pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
+        self.macrdp.link_rtt_ms = Some(handle);
+    }
+
+    /// (macrdp 15) Publish this connection's accept-time TCP RTT (0 = unknown).
+    pub(super) fn store_link_rtt(&self, rtt_ms: u32) {
+        if let Some(cell) = &self.macrdp.link_rtt_ms {
+            cell.store(rtt_ms, Ordering::Relaxed);
+            debug!(rtt_ms, "sampled TCP link RTT at accept");
+        }
+    }
+}
+
+/// (macrdp 15) The kernel's smoothed TCP RTT for an accepted connection, in
+/// ms, via `getsockopt(TCP_CONNECTION_INFO)` (macOS). The kernel seeds srtt from the
+/// SYN/SYN-ACK exchange, so a value exists right at accept. `None` on error or on
+/// platforms without the option; a sub-ms LAN RTT maps to 1, keeping 0 for "unknown".
+#[cfg(target_os = "macos")]
+pub(super) fn tcp_srtt_ms(stream: &tokio::net::TcpStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    // SAFETY: `tcp_connection_info` is a plain C struct, valid when zeroed.
+    let mut info: libc::tcp_connection_info = unsafe { core::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(size_of::<libc::tcp_connection_info>()).ok()?;
+    // SAFETY: fd is a live TCP socket owned by `stream`; `info`/`len` describe a
+    // properly sized, writable out-buffer for this socket option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            core::ptr::from_mut(&mut info).cast(),
+            &mut len,
+        )
+    };
+    // tcpi_srtt is already in milliseconds on macOS.
+    (rc == 0).then(|| info.tcpi_srtt.max(1))
+}
+
+/// (macrdp 15) No kernel RTT outside macOS.
+#[cfg(not(target_os = "macos"))]
+pub(super) fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
+    None
 }
 
 /// (macrdp 2/3/8) The client loop's audio arm: one per connection.
@@ -407,6 +456,69 @@ mod tests {
     #[cfg(not(feature = "egfx"))]
     use crate::ServerEvent;
 
+    mod link_rtt {
+        use super::super::super::{ConnectionSource, IncomingConnection, NextConnection, TcpConnectionSource};
+        use super::*;
+        use crate::TransportTls;
+
+        struct ClosedSource;
+
+        #[async_trait::async_trait]
+        impl ConnectionSource for ClosedSource {
+            type Stream = tokio::io::DuplexStream;
+
+            async fn accept(&mut self) -> std::io::Result<Option<IncomingConnection<Self::Stream>>> {
+                Ok(None)
+            }
+        }
+
+        #[tokio::test]
+        async fn the_tcp_source_samples_the_rtt_at_accept() {
+            let listener = tokio::net::TcpListener::bind((core::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut source = TcpConnectionSource { listener };
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let incoming = source.accept().await.unwrap().unwrap();
+            // macOS only; a loopback RTT below 1 ms reads as 1.
+            assert_eq!(incoming.link_rtt_ms.is_some(), cfg!(target_os = "macos"));
+            assert_ne!(incoming.link_rtt_ms, Some(0));
+        }
+
+        async fn serve(server: &mut RdpServer, link_rtt_ms: Option<u32>) {
+            let (stream, client) = tokio::io::duplex(64);
+            drop(client);
+            let mut incoming = IncomingConnection::new(stream, TransportTls::Managed, None);
+            incoming.link_rtt_ms = link_rtt_ms;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                server.serve_connection(NextConnection::Incoming(incoming), &mut ClosedSource),
+            )
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_fresh_connection_publishes_its_rtt_or_unknown() {
+            let mut server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .build();
+            let cell = Arc::new(AtomicU32::new(999));
+            server.set_link_rtt_handle(Arc::clone(&cell));
+
+            serve(&mut server, Some(42)).await;
+            assert_eq!(cell.load(Ordering::Relaxed), 42);
+
+            // A connection without a sample does not inherit the previous one's.
+            serve(&mut server, None).await;
+            assert_eq!(cell.load(Ordering::Relaxed), 0);
+        }
+    }
+
     #[tokio::test]
     async fn the_next_wave_waits_until_the_previous_one_is_written() {
         let (sender, receiver) = mpsc::channel::<AudioWave>(AUDIO_CHANNEL_CAPACITY);
@@ -573,7 +685,7 @@ mod tests {
 
     mod rdpdr_drive {
         use core::any::TypeId;
-        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::sync::atomic::AtomicUsize;
 
         use ironrdp_acceptor::{Acceptor, DesktopSize};
         use ironrdp_pdu::nego::SecurityProtocol;

@@ -292,6 +292,20 @@ fn migrate_egfx_lossy() -> bool {
     *ENABLED.get_or_init(|| env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
 }
 
+/// (macrdp 15) Link-RTT gate: a connection whose accept-time TCP RTT is at or above
+/// `MACRDP_UDP_OFFER_MAX_RTT_MS` (default 80; 0 disables) runs plain TCP from the
+/// first byte. On overlay links (VPN, ZeroTier, mobile) the tunnel predictably
+/// wedges. Read once.
+fn offer_max_rtt_ms() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MACRDP_UDP_OFFER_MAX_RTT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(80)
+    })
+}
+
 fn tunnel_name(tunnel: SoftSyncTunnelType) -> &'static str {
     if tunnel == SoftSyncTunnelType::LOSSY_UDP {
         "lossy (UdpFecL)"
@@ -394,6 +408,22 @@ impl RdpServer {
             .is_some_and(CookieRegistry::multitransport_suppressed)
         {
             info!("multitransport offer SUPPRESSED (tunnel-death cooldown) \u{2014} this connection runs plain TCP");
+            return;
+        }
+        // (macrdp 15) The accept-time TCP RTT gate.
+        let max_rtt = offer_max_rtt_ms();
+        let rtt = self
+            .macrdp
+            .link_rtt_ms
+            .as_ref()
+            .map_or(0, |c| c.load(Ordering::Relaxed));
+        if max_rtt > 0 && rtt >= max_rtt {
+            info!(
+                link_rtt_ms = rtt,
+                max_rtt_ms = max_rtt,
+                "multitransport offer WITHHELD (link RTT above the offer gate) \u{2014} this connection runs plain TCP; \
+                 UDP tunnels wedge on high-latency overlay links"
+            );
             return;
         }
 
@@ -1211,5 +1241,35 @@ mod tests {
             .with_no_display()
             .build();
         assert_eq!(server.dynamic_channel_factories.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_link_rtt_at_the_gate_withholds_the_offer() {
+        let max = offer_max_rtt_ms();
+        if max == 0 {
+            return; // MACRDP_UDP_OFFER_MAX_RTT_MS=0 disables the gate.
+        }
+        let mut server = RdpServer::builder()
+            .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.set_multitransport_provider(Some(Box::new(Offer)));
+        server.set_multitransport_cookie_registry(Some(CookieRegistry::new()));
+        let rtt = Arc::new(AtomicU32::new(max));
+        server.set_link_rtt_handle(Arc::clone(&rtt));
+
+        server.mt_offer(&mut acceptor());
+        assert!(server.macrdp.mt.pending_offer.is_none());
+
+        rtt.store(max - 1, Ordering::Relaxed);
+        server.mt_offer(&mut acceptor());
+        assert!(server.macrdp.mt.pending_offer.is_some());
+
+        // 0 = unknown: the gate lets the offer through.
+        rtt.store(0, Ordering::Relaxed);
+        server.mt_offer(&mut acceptor());
+        assert!(server.macrdp.mt.pending_offer.is_some());
     }
 }
