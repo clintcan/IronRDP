@@ -4,6 +4,15 @@
 
 mod macros;
 
+// (macrdp) macrdp's own channel modules, kept alongside upstream's
+// equivalents (which stay inert: macrdp never sets their factories).
+mod audin; // (macrdp 25)
+#[cfg(feature = "multitransport")]
+mod mt;
+mod rdcamera; // (macrdp 19)
+mod rdpdr_drive;
+mod rdpeusb;
+
 pub mod autodetect;
 mod builder;
 mod capabilities;
@@ -27,6 +36,11 @@ mod sound;
 #[cfg(feature = "usb")]
 mod urbdrc;
 
+// (macrdp 25)
+pub use audin::{
+    AUDIO_INPUT_CHANNEL_NAME, AudinSampleSink, AudinServer, AudinServerFactory, choose_capture_format,
+    is_acceptable_capture_format, server_input_formats,
+};
 pub use clipboard::CliprdrServerFactory;
 pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
@@ -48,13 +62,32 @@ pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
 pub use ironrdp_rdpeusb::io::{CompletionData, DeviceText, InternalIoControlPacket};
+#[cfg(feature = "multitransport")]
+pub use mt::dtls::DtlsServerContext;
+#[cfg(feature = "multitransport")]
+pub use mt::listener::{ListenerConfig, UdpMultitransportListener};
+#[cfg(feature = "multitransport")]
+pub use mt::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};
+// (macrdp 19)
+pub use rdcamera::{
+    CameraSampleSink, RDCAMERA_CHANNEL_NAME, RdCameraDeviceProcessor, RdCameraServer, RdCameraServerFactory,
+};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
+pub use rdpdr_drive::{
+    AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory,
+    RdpdrHandle, RdpdrServerHandler, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD,
+    SCARD_SHARE_DIRECT, SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
+};
 pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
 pub use rdpei::{
     CsReadyFlags, CsReadyPdu, DismissHoveringTouchContactPdu, PenContact, PenContactDataFlags, PenContactFields,
     PenContactFlags, PenEventPdu, PenFlags, PenFrame, RdpInputProtocolVersion, RdpeiHandler, RdpeiServer,
     RdpeiServerFactory, ScReadyFeatures, TouchContact, TouchContactDataFlags, TouchContactFields, TouchContactFlags,
     TouchEventPdu, TouchFrame,
+};
+pub use rdpeusb::{
+    DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,
+    UsbHandle, UsbPipe,
 };
 #[cfg(feature = "__test")]
 pub use server::audio_redirection_wanted;
@@ -77,7 +110,7 @@ pub use server::{
     FINAL_FLUSH_TIMEOUT, MAX_QUEUED_REPLY_BYTES, OutboundQueue, QueuedWriter, client_max_request_size,
     dispatch_static_channel_events, drive_static_channel_events, pick_remotefx_codec,
 };
-pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
+pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]
 pub use urbdrc::{
     CompletionFut, DeviceFactory, PendingHandle, PendingRequest, RdpUsbDeviceAnnounceInfo, UsbDeviceAnnounce,

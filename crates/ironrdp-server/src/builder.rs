@@ -12,8 +12,8 @@ use super::display::{DesktopSize, DisplayContext, RdpServerDisplay};
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{
-    ConnectionBinder, ConnectionHandler, ConnectionPolicy, CredentialValidator, DynamicChannelFactory, RdpServer,
-    RdpServerOptions, RdpServerSecurity, StaticChannelFactory,
+    ConnectionBinder, ConnectionHandler, ConnectionPolicy, CredentialValidator, DynamicChannelFactory,
+    MacrdpChannelFactories, RdpServer, RdpServerOptions, RdpServerSecurity, StaticChannelFactory,
 };
 use crate::error::ServerResult;
 #[cfg(feature = "usb")]
@@ -70,6 +70,8 @@ pub struct BuilderDone {
     udp_bind_addr: Option<SocketAddr>,
     max_static_channel_message_size: Option<usize>,
     max_dynamic_channel_message_size: Option<usize>,
+    /// (macrdp 11) macrdp's own channel factories; see `MacrdpChannelFactories`.
+    macrdp_channels: MacrdpChannelFactories,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -190,6 +192,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_bind_addr: None,
                 max_static_channel_message_size: None,
                 max_dynamic_channel_message_size: None,
+                macrdp_channels: MacrdpChannelFactories::default(),
             },
         }
     }
@@ -231,6 +234,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_bind_addr: None,
                 max_static_channel_message_size: None,
                 max_dynamic_channel_message_size: None,
+                macrdp_channels: MacrdpChannelFactories::default(),
             },
         }
     }
@@ -277,6 +281,40 @@ impl RdpServerBuilder<BuilderDone> {
 
     pub fn with_rdpdr_factory(mut self, rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>) -> Self {
         self.state.rdpdr_factory = rdpdr_factory;
+        self
+    }
+
+    /// (macrdp 11) Configure macrdp's RDPDR drive + smart card channel.
+    /// The client's redirected devices are surfaced to the
+    /// [`RdpdrServerHandler`](crate::RdpdrServerHandler) backend. Don't combine
+    /// with [`Self::with_rdpdr_factory`]: both register the `RDPDR` channel, and
+    /// upstream's wins.
+    pub fn with_rdpdr_drive_factory(mut self, factory: Option<Box<dyn crate::RdpdrDriveServerFactory>>) -> Self {
+        self.state.macrdp_channels.rdpdr_drive = factory;
+        self
+    }
+
+    /// (macrdp 16) Configure macrdp's server-direction MS-RDPEUSB (USB
+    /// redirection) channel, driven through the
+    /// [`UrbdrcServerFactory`](crate::UrbdrcServerFactory)-built DVC processor.
+    /// Don't combine with the `usb` feature's `with_usb_factory`: both register `URBDRC`.
+    pub fn with_urbdrc_factory(mut self, factory: Option<Box<dyn crate::UrbdrcServerFactory>>) -> Self {
+        self.state.macrdp_channels.urbdrc = factory;
+        self
+    }
+
+    /// (macrdp 19) Configure server-direction MS-RDPECAM (camera
+    /// redirection). When set, the `RDCamera_Device_Enumerator` DVC is advertised.
+    pub fn with_camera_factory(mut self, factory: Option<Box<dyn crate::RdCameraServerFactory>>) -> Self {
+        self.state.macrdp_channels.camera = factory;
+        self
+    }
+
+    /// (macrdp 25) Configure macrdp's MS-RDPEAI audio-input (microphone)
+    /// channel. Don't combine with [`Self::with_rdpeai_factory`]: both register
+    /// `AUDIO_INPUT`.
+    pub fn with_audin_factory(mut self, factory: Option<Box<dyn crate::AudinServerFactory>>) -> Self {
+        self.state.macrdp_channels.audin = factory;
         self
     }
 
@@ -591,6 +629,8 @@ impl RdpServerBuilder<BuilderDone> {
         #[cfg(feature = "egfx")]
         server.set_egfx_core_frame_ack_limit(self.state.egfx_core_frame_ack_limit);
         server.set_connection_binder(self.state.connection_binder);
+        // (macrdp 2, 11)
+        server.install_macrdp_channels(self.state.macrdp_channels);
         server
     }
 }

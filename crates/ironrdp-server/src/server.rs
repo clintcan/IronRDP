@@ -83,6 +83,12 @@ use crate::{RdpdrServerFactory, SoundServerFactory, builder, capabilities};
 #[cfg(feature = "usb")]
 use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::UrbdrcDeviceServer};
 
+// (macrdp) macrdp's additions, kept out of this file. A child module, so it
+// reaches `RdpServer`'s private fields without widening them.
+#[path = "macrdp.rs"]
+mod macrdp;
+pub(crate) use macrdp::MacrdpChannelFactories;
+
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
@@ -425,6 +431,25 @@ pub trait ConnectionHandler: Send {
     ) -> PostConnectionAction {
         let _ = (peer, duration, error);
         PostConnectionAction::Continue
+    }
+
+    /// (macrdp 18) Called once per connection after the CredSSP/NLA
+    /// exchange resolves (only under Hybrid security), including for a preemption
+    /// candidate. `success` is whether the client's credentials validated; `reason`
+    /// is a short error description when they did not (auth did not complete:
+    /// dominated by bad credentials, but also a client abort or a mid-exchange
+    /// transport error). Default: no-op.
+    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        let _ = (success, reason);
+    }
+
+    /// (macrdp 20) Called once per connection when the capability
+    /// exchange completes (not on a deactivation–reactivation), carrying the
+    /// client-fingerprint identity: the GCC Client Core Data hostname / raw RDP
+    /// version / build number plus the General-capset platform (formatted).
+    /// Informational fingerprinting: a client can claim anything. Default: no-op.
+    fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
+        let _ = (client_name, rdp_version, client_build, platform);
     }
 }
 
@@ -1152,6 +1177,10 @@ pub enum TransportTls {
 /// [`RdpServer::serve`] through a [`ConnectionSource`].
 #[derive(Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "(macrdp 15) link_rtt_ms is macrdp's, not public API"
+)]
 pub struct IncomingConnection<S> {
     /// The accepted stream. Socket options are the source's to set; see
     /// [`RdpServer::run_connection`].
@@ -1175,6 +1204,9 @@ pub struct IncomingConnection<S> {
     /// transport, a Unix path, a vsock port), and this lets the embedder find
     /// its record of it again. The server does not look at it.
     pub tag: u64,
+    /// (macrdp 15) The kernel's accept-time TCP RTT in ms, sampled by
+    /// [`TcpConnectionSource`] while the concrete socket is reachable.
+    pub(crate) link_rtt_ms: Option<u32>,
 }
 
 impl<S> IncomingConnection<S> {
@@ -1201,6 +1233,7 @@ impl<S> IncomingConnection<S> {
             peer,
             local_addr: None,
             tag: 0,
+            link_rtt_ms: None, // (macrdp 15)
         }
     }
 
@@ -1344,10 +1377,14 @@ impl ConnectionSource for TcpConnectionSource {
         if let Err(error) = stream.set_nodelay(true) {
             warn!(?peer, %error, "Failed to set TCP_NODELAY; interactive latency may suffer");
         }
+        // (macrdp 15) Sample the kernel's smoothed TCP RTT while the concrete
+        // socket is reachable: the accept loop is generic over the stream.
+        let link_rtt_ms = macrdp::tcp_srtt_ms(&stream);
         let mut incoming = IncomingConnection::new(stream, TransportTls::Managed, Some(peer));
         if let Ok(local_addr) = incoming.stream.local_addr() {
             incoming = incoming.with_local_addr(local_addr);
         }
+        incoming.link_rtt_ms = link_rtt_ms;
         Ok(Some(incoming))
     }
 }
@@ -1515,6 +1552,8 @@ pub struct RdpServer {
     /// frame window; see [`Self::set_egfx_core_frame_ack_limit`].
     #[cfg(feature = "egfx")]
     egfx_core_frame_ack_limit: bool,
+    /// (macrdp) Everything macrdp adds per server, in one place.
+    macrdp: macrdp::MacrdpServerState,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -1827,6 +1866,10 @@ pub enum ServerEvent {
     AutoDetectRttRequest,
     #[cfg(feature = "usb")]
     Usb(UrbdrcServerMessage),
+    /// (macrdp 11) macrdp's own RDPDR drive + smart card channel.
+    RdpdrDrive(crate::RdpdrDriveMessage),
+    /// (macrdp 16) macrdp's own URBDRC USB channel.
+    Urbdrc(crate::UrbdrcServerMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1887,6 +1930,10 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+            // (macrdp 11)
+            Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
+            // (macrdp 16)
+            Self::Urbdrc(..) => f.write_str("Urbdrc(..)"),
         }
     }
 }
@@ -2031,6 +2078,8 @@ struct ServerCredentialsHandler {
     validator: Option<Arc<dyn CredentialValidator>>,
     require_authenticated: bool,
     authenticated_credentials: Option<Credentials>,
+    /// (macrdp 18) Told the CredSSP outcome in [`complete_security_upgrade`].
+    auth_observer: Option<SharedConnectionHandler>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2196,6 +2245,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        link_rtt_ms: None, // (macrdp 15)
                     }))
                 }
                 // The stream is already past TLS (terminated at a lower
@@ -2209,6 +2259,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        link_rtt_ms: None, // (macrdp 15)
                     }))
                 }
             },
@@ -2218,6 +2269,7 @@ impl PendingConnection {
                 acceptor,
                 local_addr: None,
                 authenticated_credentials: credentials_handler.authenticated_credentials,
+                link_rtt_ms: None, // (macrdp 15)
             })),
         }
     }
@@ -2234,6 +2286,8 @@ struct NegotiatedConnection<S> {
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
     authenticated_credentials: Option<Credentials>,
+    /// (macrdp 15) The accept-time TCP RTT of a preemption candidate.
+    link_rtt_ms: Option<u32>,
 }
 
 /// A negotiated TCP connection whose session has not started.
@@ -2357,6 +2411,9 @@ struct ConnectionState {
     /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
     pointer_cache_size: u16,
     color_pointer_cache_size: u16,
+    /// (macrdp 12) Everything macrdp adds per connection, in one place.
+    #[cfg(feature = "multitransport")]
+    macrdp: macrdp::MacrdpConnectionState,
 }
 
 /// What the client asked for in its logon notification; see [`RdpServer::send_logon_notification`].
@@ -2544,7 +2601,11 @@ impl ConnectionState {
                     return self.handle_io_channel_data(data);
                 }
                 if Some(data.channel_id) == context.message_channel_id {
-                    return Ok(self.handle_message_channel_data(context.now_ms, data));
+                    let outputs = self.handle_message_channel_data(context.now_ms, data);
+                    // (macrdp 12) The empty Soft-Sync a successful response may owe.
+                    #[cfg(feature = "multitransport")]
+                    let outputs = self.mt_with_owed_soft_sync(outputs, context.user_channel_id)?;
+                    return Ok(outputs);
                 }
                 let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) else {
                     warn!(channel_id = data.channel_id, "Unexpected channel received");
@@ -2752,6 +2813,9 @@ impl ConnectionState {
                     self.udp_migration_allowed = true;
                     debug!("Multitransport confirmed after finalization, EGFX may migrate to UDP");
                 }
+                // (macrdp 12)
+                #[cfg(feature = "multitransport")]
+                self.mt_on_response(&pdu);
             }
             Err(error) => {
                 warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
@@ -2906,7 +2970,7 @@ where
         // uses this value in practice.
         let client_name = "rdp-client".to_owned();
 
-        ironrdp_acceptor::accept_credssp_with(
+        let result = ironrdp_acceptor::accept_credssp_with(
             framed,
             acceptor,
             &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
@@ -2915,8 +2979,11 @@ where
             None,
             credentials_handler,
         )
-        .await
-        .map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+        .await;
+        // (macrdp 18) After `mark_security_upgrade_as_done`, so a pre-TLS
+        // negotiation error does not report a failed login.
+        macrdp::report_authentication(credentials_handler.auth_observer.as_ref(), &result);
+        result.map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
     }
 
     Ok(())
@@ -3085,6 +3152,8 @@ struct NegotiationContext {
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     requires_authenticated_credentials: bool,
+    /// (macrdp 18) So a candidate's CredSSP outcome is reported too.
+    connection_handler: Option<SharedConnectionHandler>,
 }
 
 /// Negotiate and authenticate a candidate connection against a cloned `ctx`,
@@ -3111,6 +3180,7 @@ where
         peer,
         local_addr,
         tag,
+        link_rtt_ms,
     } = incoming;
     let size = ctx.display.lock().await.size().await;
     let capabilities = capabilities::capabilities(&ctx.opts, size);
@@ -3124,6 +3194,7 @@ where
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
             require_authenticated: ctx.requires_authenticated_credentials,
+            auth_observer: ctx.connection_handler.clone(), // (macrdp 18)
             ..ServerCredentialsHandler::default()
         },
     );
@@ -3143,6 +3214,7 @@ where
         Ok(Some(mut negotiated)) => {
             debug!(?peer, "candidate authenticated -- eligible to preempt the live session");
             negotiated.local_addr = local_addr;
+            negotiated.link_rtt_ms = link_rtt_ms; // (macrdp 15)
             Some(AuthenticatedConnection {
                 connection: Box::new(negotiated),
                 peer,
@@ -3296,6 +3368,7 @@ impl RdpServer {
             logon_notification_on_request: false,
             #[cfg(feature = "egfx")]
             egfx_core_frame_ack_limit: false,
+            macrdp: macrdp::MacrdpServerState::default(),
         }
     }
 
@@ -3926,6 +3999,9 @@ impl RdpServer {
             pending_logon_notification: None,
             pointer_cache_size: 0,
             color_pointer_cache_size: 0,
+            // (macrdp 12)
+            #[cfg(feature = "multitransport")]
+            macrdp: macrdp::MacrdpConnectionState::default(),
         }
     }
 
@@ -4005,6 +4081,9 @@ impl RdpServer {
         for event in keep {
             let _ = self.ev_sender.send(event);
         }
+
+        // (macrdp 2) The replaced session's audio rides its own channel.
+        self.discard_stale_macrdp_audio();
     }
 
     /// Build the cheap, cloned snapshot a preempting candidate negotiates
@@ -4017,6 +4096,7 @@ impl RdpServer {
             display: Arc::clone(&self.display),
             credential_validator: self.credential_validator.clone(),
             requires_authenticated_credentials: self.connection_binder.is_some(),
+            connection_handler: self.connection_handler.clone(), // (macrdp 18)
         }
     }
 
@@ -4245,10 +4325,14 @@ impl RdpServer {
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
                 require_authenticated: self.connection_binder.is_some(),
+                auth_observer: self.connection_handler.clone(), // (macrdp 18)
                 ..ServerCredentialsHandler::default()
             },
         );
         pending.acceptor.set_credssp_backend(self.credssp_backend);
+        // (macrdp 12) macrdp's own UDP offer.
+        #[cfg(feature = "multitransport")]
+        self.mt_offer(&mut pending.acceptor);
         pending
     }
 
@@ -4265,7 +4349,12 @@ impl RdpServer {
             acceptor,
             local_addr,
             authenticated_credentials,
+            link_rtt_ms,
         } = negotiated;
+        // (macrdp 15) A preemption winner was sampled as a candidate.
+        if let Some(rtt) = link_rtt_ms {
+            self.store_link_rtt(rtt);
+        }
         self.clear_bound_connection();
         let _binding = BoundConnectionGuard {
             display: Arc::clone(&self.bound_display),
@@ -4581,6 +4670,11 @@ impl RdpServer {
             // took the session over. Discard any such leftover before serving
             // it; every other event is put back in order.
             NextConnection::Authenticated(_) => self.discard_stale_session_events().await,
+        }
+        // (macrdp 15) A fresh connection's accept-time TCP RTT, before its offer
+        // is decided (0 = unknown). A winner is stored in `finalize_negotiated`.
+        if let NextConnection::Incoming(incoming) = &connection {
+            self.store_link_rtt(incoming.link_rtt_ms.unwrap_or(0));
         }
         self.clear_bound_connection();
         let mut source_open = true;
@@ -5100,6 +5194,9 @@ impl RdpServer {
                 })
                 .count()
         };
+        // (macrdp 4) CLIPRDR first, RDPDR last.
+        #[cfg(feature = "egfx")]
+        macrdp::prioritize_batch(events);
         let mut pending = core::mem::take(events).into_iter();
         while let Some(event) = pending.next() {
             // Validity-guarded stateful events and audio waves wait for earlier queued writes to finish so a stale
@@ -5772,6 +5869,12 @@ impl RdpServer {
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
                     EgfxServerMessage::SendMessages { messages } => {
+                        // (macrdp 12) Once EGFX has migrated, it rides macrdp's
+                        // tunnel instead of TCP.
+                        #[cfg(feature = "multitransport")]
+                        let Some(messages) = conn.mt_route_egfx(messages)? else {
+                            continue;
+                        };
                         self.dispatch_egfx_messages(
                             conn,
                             messages,
@@ -5781,6 +5884,8 @@ impl RdpServer {
                             udp_transport,
                         )
                         .await?;
+                        #[cfg(feature = "multitransport")]
+                        conn.mt_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
@@ -5824,6 +5929,14 @@ impl RdpServer {
                                 .map_err(|e| ServerError::io("write_all", e))?;
                         }
                     }
+                }
+                // (macrdp 11) macrdp's RDPDR device-I/O requests: see `macrdp::dispatch_rdpdr_drive`.
+                ServerEvent::RdpdrDrive(message) => {
+                    macrdp::dispatch_rdpdr_drive(conn, writer, user_channel_id, message).await?;
+                }
+                // (macrdp 16) A `UsbHandle`'s transfer: see `macrdp::dispatch_urbdrc`.
+                ServerEvent::Urbdrc(message) => {
+                    macrdp::dispatch_urbdrc(conn, writer, user_channel_id, message).await?;
                 }
             }
         }
@@ -6176,6 +6289,11 @@ impl RdpServer {
         let mut reply_writer = writer.for_replies();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let mut ev_receiver = ev_receiver.lock().await;
+        // (macrdp 2/3/8) Audio from macrdp's own bounded channel.
+        let macrdp_audio_receiver = self.macrdp_audio_receiver();
+        let mut macrdp_audio = macrdp::AudioDispatch::new(macrdp_audio_receiver.as_deref()).await;
+        // (macrdp 12) Client-to-server data from macrdp's tunnel.
+        let mut macrdp_tunnel = macrdp::TunnelInbound::take(conn);
         let mut buffer = vec![0u8; 4096];
         let mut events = Vec::with_capacity(100);
 
@@ -6301,6 +6419,16 @@ impl RdpServer {
                         tracing::trace!(batch_size, dispatch_ms, "Dispatched server event batch");
                     }
                     ConnectionIteration::state(result)
+                }
+                // (macrdp 2/3/8) One wave at a time, not gated on `queue_idle`:
+                // see `macrdp::AudioDispatch`.
+                wave = macrdp_audio.next_wave(), if macrdp_audio.is_open() => {
+                    macrdp_audio.dispatch(conn, &mut writer, user_channel_id, wave)?;
+                    ConnectionIteration::state(RunState::Continue)
+                }
+                // (macrdp 12) Replies go back over the tunnel, not the queue.
+                pdu = macrdp_tunnel.recv(), if macrdp_tunnel.is_open() => {
+                    ConnectionIteration::outputs(macrdp_tunnel.process(conn, pdu))
                 }
                 _ = cookie_interval.tick() => {
                     self.rotate_auto_reconnect_cookie(conn, &mut writer, io_channel_id, user_channel_id)
@@ -6439,7 +6567,15 @@ impl RdpServer {
     {
         debug!("Client accepted");
 
-        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
+        // (macrdp 20) Before the auto-reconnect and credential checks, so a denied
+        // attempt is fingerprinted too.
+        if !result.reactivation {
+            macrdp::report_client_fingerprint(self.connection_handler.as_ref(), &result);
+        }
+
+        // (macrdp 30) A cookie that fails verification falls back to a normal logon.
+        let stale_cookie = self.is_stale_reconnect_cookie(result.auto_reconnect.as_ref());
+        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref().filter(|_| !stale_cookie) {
             if !self.verify_auto_reconnect_cookie(reconnect) {
                 warn!("Auto-reconnect cookie validation rejected");
                 send_access_denied(acceptor, writer).await?;
@@ -6898,6 +7034,9 @@ impl RdpServer {
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
         let mut conn = self.attach_channels(&mut acceptor).await;
+        // (macrdp 12)
+        #[cfg(feature = "multitransport")]
+        self.mt_begin_connection(&mut conn);
         let udp_bind_addr = self
             .opts
             .udp_bind_addr
@@ -6937,7 +7076,11 @@ impl RdpServer {
             // called, see `PendingConnection::new`), so the handler below
             // simply never runs and this is exactly `accept_finalize`'s own
             // behavior.
-            let finalize = ironrdp_acceptor::accept_finalize_with_handlers(
+            // (macrdp 35) `_with_hooks`: the connect-time auto-detect runs
+            // inside this future, so FINALIZE_TIMEOUT bounds it too. It only
+            // runs when auto-detect is enabled and the client opened the window.
+            let autodetect = &mut conn.autodetect;
+            let finalize = ironrdp_acceptor::accept_finalize_with_hooks(
                 framed,
                 &mut acceptor,
                 self,
@@ -6954,6 +7097,8 @@ impl RdpServer {
                         multitransport::accept(udp_bind_addr, tls_config, &request).await
                     }));
                 },
+                // (macrdp 35)
+                async |framed, window| macrdp::connect_time_autodetect_hook(framed, window, autodetect.as_mut()).await,
             );
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
                 Ok(res) => res.map_err_kind("failed to accept client during finalize", ServerErrorKind::Connector)?,
@@ -6968,6 +7113,10 @@ impl RdpServer {
                     ));
                 }
             };
+
+            // (macrdp 12)
+            #[cfg(feature = "multitransport")]
+            conn.mt_on_finalized(&acceptor, result.reactivation);
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
@@ -7907,6 +8056,7 @@ mod preempt_tests {
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
             credential_validator: None,
             requires_authenticated_credentials: false,
+            connection_handler: None, // (macrdp 18)
         }
     }
 
