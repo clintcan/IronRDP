@@ -36,6 +36,7 @@ __test = ["dep:visibility"]
 
 [dependencies]
 rand = "0.9"
+anyhow = "1.0" # (macrdp) error type of macrdp's own channel modules (rdpdr_drive)
 tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] } # public
 tokio-rustls = "0.26" # public
 async-trait = "0.1"

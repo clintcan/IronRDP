@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ironrdp_svc::server_encode_svc_messages;
+use ironrdp_tokio::FramedWrite as _;
 use rdpsnd::server::RdpsndServer;
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
@@ -13,13 +14,26 @@ use tracing::{debug, warn};
 use super::{ConnectionState, QueuedWriter, RdpServer, WriteCompletion, rdpsnd};
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
-use crate::{AudioWave, ServerError, ServerErrorExt as _, ServerResult};
+use crate::rdpdr_drive::RdpdrDriveChannelFactory;
+use crate::{
+    AudioWave, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory, ServerError, ServerErrorExt as _,
+    ServerResult,
+};
 
 /// (macrdp) Per-server state for macrdp's divergences, in one `RdpServer` field.
 #[derive(Default)]
 pub(super) struct MacrdpServerState {
     /// (2/8) Dedicated audio channel, read by the client loop's audio arm.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<AudioWave>>>>,
+}
+
+/// (macrdp 11) macrdp's own channel factories, set on the builder and handed to
+/// [`RdpServer::install_macrdp_channels`]. They are kept alongside upstream's
+/// equivalents (`with_rdpdr_factory`), which macrdp never sets. Never set both a
+/// macrdp factory and its upstream counterpart: they register the same channel name.
+#[derive(Default)]
+pub(crate) struct MacrdpChannelFactories {
+    pub(crate) rdpdr_drive: Option<Box<dyn RdpdrDriveServerFactory>>,
 }
 
 /// (macrdp 2) Bounded to ~1 s of audio at the steady-state 42.78 waves/s
@@ -32,9 +46,22 @@ const AUDIO_CHANNEL_CAPACITY: usize = 50;
     reason = "macrdp's methods stay out of server.rs so the fork's hooks there stay small"
 )]
 impl RdpServer {
-    /// (macrdp) Installs macrdp's dedicated audio channel.
+    /// (macrdp) Installs macrdp's channel factories and its dedicated audio channel.
     /// Called once by the builder, right after [`Self::new`].
-    pub(crate) fn install_macrdp_channels(&mut self) {
+    pub(crate) fn install_macrdp_channels(&mut self, channels: MacrdpChannelFactories) {
+        // (macrdp 11) Attached per connection after upstream's own channels,
+        // through upstream's static channel factories.
+        if let Some(mut rdpdr) = channels.rdpdr_drive {
+            if self.rdpdr_factory.is_some() {
+                warn!(
+                    "Both with_rdpdr_factory and with_rdpdr_drive_factory are set; upstream's RDPDR \
+                     server takes the RDPDR channel, and macrdp's drive and smart card redirection is off"
+                );
+            }
+            rdpdr.set_sender(self.ev_sender.clone());
+            self.static_channel_factories
+                .push(Box::new(RdpdrDriveChannelFactory::new(rdpdr, self.ev_sender.clone())));
+        }
         // No sound factory: no rdpsnd channel, so no audio arm.
         if let Some(snd) = self.sound_factory.as_mut() {
             let (audio_sender, audio_receiver) = mpsc::channel::<AudioWave>(AUDIO_CHANNEL_CAPACITY);
@@ -220,6 +247,30 @@ impl AudioLagModel {
     }
 }
 
+/// (macrdp 11) Ships macrdp's RDPDR device-I/O requests on the RDPDR channel.
+///
+/// Not upstream's `StaticChannelWithCompletion`: that one sets `SHOW_PROTOCOL` on a
+/// payload above `CHANNEL_CHUNK_LENGTH`, and Windows drops a multi-chunk RDPDR PDU
+/// that carries it (a large `DeviceWriteRequest` is such a PDU). These messages go
+/// out with no channel flags.
+pub(super) async fn dispatch_rdpdr_drive(
+    conn: &mut ConnectionState,
+    writer: &mut QueuedWriter,
+    user_channel_id: u16,
+    message: RdpdrDriveMessage,
+) -> ServerResult<()> {
+    let RdpdrDriveMessage::SendMessages(messages) = message;
+    let Some(channel_id) = conn.get_channel_id_by_type::<RdpdrDriveServer>() else {
+        warn!("No RDPDR channel, dropping device-I/O request");
+        return Ok(());
+    };
+    let data = server_encode_svc_messages(messages, channel_id, user_channel_id).map_err(ServerError::encode)?;
+    writer
+        .write_all(&data)
+        .await
+        .map_err(|e| ServerError::io("write_all", e))
+}
+
 /// (macrdp 4) Reorders one event batch into three tiers: CLIPRDR, then EGFX
 /// video and everything else, then RDPDR, since all of them share the one
 /// outbound queue.
@@ -243,7 +294,7 @@ pub(super) fn prioritize_batch(events: &mut [ServerEvent]) {
             ServerEvent::Clipboard(_)
             | ServerEvent::ClipboardWithCompletion(..)
             | ServerEvent::ClipboardWithValidity { .. } => 0,
-            ServerEvent::Rdpdr(_) => 2,
+            ServerEvent::Rdpdr(_) | ServerEvent::RdpdrDrive(_) => 2,
             _ => 1,
         }
     }
@@ -427,6 +478,158 @@ mod tests {
         assert_eq!(admitted, 22);
     }
 
+    mod rdpdr_drive {
+        use core::any::TypeId;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use ironrdp_acceptor::{Acceptor, DesktopSize};
+        use ironrdp_pdu::nego::SecurityProtocol;
+        use ironrdp_svc::{ChannelFlags, SvcMessage};
+
+        use super::*;
+        use crate::rdpdr_drive::IoRouter;
+        use crate::{AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServerHandler};
+
+        #[derive(Default)]
+        struct Calls {
+            set_sender: AtomicUsize,
+            build_backend: AtomicUsize,
+            set_handle: AtomicUsize,
+        }
+
+        struct Backend(Arc<Calls>);
+
+        impl core::fmt::Debug for Backend {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("Backend")
+            }
+        }
+
+        impl RdpdrServerHandler for Backend {
+            fn set_handle(&mut self, _handle: RdpdrHandle) {
+                self.0.set_handle.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_devices_announced(&mut self, _devices: &[AnnouncedDevice]) {}
+        }
+
+        struct Factory(Arc<Calls>);
+
+        impl crate::ServerEventSender for Factory {
+            fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {
+                self.0.set_sender.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        impl RdpdrBackendFactory for Factory {
+            fn build_backend(&self) -> Box<dyn RdpdrServerHandler> {
+                self.0.build_backend.fetch_add(1, Ordering::Relaxed);
+                Box::new(Backend(Arc::clone(&self.0)))
+            }
+            fn computer_name(&self) -> String {
+                "mac".to_owned()
+            }
+        }
+
+        impl RdpdrDriveServerFactory for Factory {}
+
+        #[tokio::test]
+        async fn the_drive_factory_attaches_a_processor_per_connection() {
+            let calls = Arc::new(Calls::default());
+            let server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .with_rdpdr_drive_factory(Some(Box::new(Factory(Arc::clone(&calls)))))
+                .build();
+            assert_eq!(calls.set_sender.load(Ordering::Relaxed), 1);
+            assert_eq!(server.static_channel_factories.len(), 1);
+
+            for connection in 1..=2 {
+                let mut acceptor = Acceptor::new(
+                    SecurityProtocol::empty(),
+                    DesktopSize {
+                        width: 1024,
+                        height: 768,
+                    },
+                    Vec::new(),
+                    None,
+                );
+                let _ = server.attach_channels(&mut acceptor).await;
+                assert_eq!(calls.build_backend.load(Ordering::Relaxed), connection);
+                assert_eq!(calls.set_handle.load(Ordering::Relaxed), connection);
+            }
+        }
+
+        #[test]
+        fn no_drive_factory_adds_no_static_channel_factory() {
+            let server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .build();
+            assert!(server.static_channel_factories.is_empty());
+        }
+
+        fn joined_rdpdr(channel_id: u16) -> ConnectionState {
+            let mut conn = ConnectionState::default();
+            let backend = Box::new(Backend(Arc::default()));
+            conn.static_channels
+                .insert(RdpdrDriveServer::new(backend, "mac".to_owned(), IoRouter::default()));
+            conn.static_channels
+                .attach_channel_id(TypeId::of::<RdpdrDriveServer>(), channel_id);
+            conn
+        }
+
+        #[tokio::test]
+        async fn a_large_request_goes_out_without_show_protocol() {
+            let payload = vec![0x5a; 3 * ironrdp_svc::CHANNEL_CHUNK_LENGTH];
+            let mut conn = joined_rdpdr(1004);
+            let queue = std::rc::Rc::new(super::super::super::OutboundQueue::default());
+            let mut writer = QueuedWriter::new(std::rc::Rc::clone(&queue));
+            dispatch_rdpdr_drive(
+                &mut conn,
+                &mut writer,
+                1002,
+                RdpdrDriveMessage::SendMessages(vec![SvcMessage::from(payload.clone())]),
+            )
+            .await
+            .unwrap();
+
+            let queued: Vec<u8> = queue
+                .pending
+                .borrow()
+                .iter()
+                .flat_map(|pdu| pdu.bytes.clone())
+                .collect();
+            let plain = server_encode_svc_messages(vec![SvcMessage::from(payload.clone())], 1004, 1002).unwrap();
+            let flagged = server_encode_svc_messages(
+                vec![SvcMessage::from(payload).with_flags(ChannelFlags::SHOW_PROTOCOL)],
+                1004,
+                1002,
+            )
+            .unwrap();
+            assert_eq!(queued, plain);
+            assert_ne!(queued, flagged);
+        }
+
+        #[tokio::test]
+        async fn a_request_without_an_rdpdr_channel_is_dropped() {
+            let queue = std::rc::Rc::new(super::super::super::OutboundQueue::default());
+            let mut writer = QueuedWriter::new(std::rc::Rc::clone(&queue));
+            dispatch_rdpdr_drive(
+                &mut ConnectionState::default(),
+                &mut writer,
+                1002,
+                RdpdrDriveMessage::SendMessages(vec![SvcMessage::from(vec![1, 2, 3])]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(queue.queued_bytes.get(), 0);
+        }
+    }
+
     #[cfg(feature = "egfx")]
     mod batch_priority {
         use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -445,6 +648,7 @@ mod tests {
             match event {
                 ServerEvent::Clipboard(_) => "clip".to_owned(),
                 ServerEvent::Rdpdr(_) => "rdpdr".to_owned(),
+                ServerEvent::RdpdrDrive(_) => "drive".to_owned(),
                 ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) => {
                     format!("egfx{}", messages.capacity())
                 }
@@ -458,6 +662,10 @@ mod tests {
                 device_id: 1,
                 file_id: 1,
             })
+        }
+
+        fn drive() -> ServerEvent {
+            ServerEvent::RdpdrDrive(RdpdrDriveMessage::SendMessages(Vec::new()))
         }
 
         fn clip() -> ServerEvent {
@@ -482,6 +690,14 @@ mod tests {
                 order,
                 ["clip", "clip", "egfx1", "other", "egfx2", "egfx3", "rdpdr", "rdpdr"]
             );
+        }
+
+        #[test]
+        fn macrdp_rdpdr_sorts_last_with_upstream_rdpdr() {
+            let mut events = vec![drive(), egfx(1), rdpdr(), clip(), drive(), egfx(2)];
+            prioritize_batch(&mut events);
+            let order: Vec<_> = events.iter().map(label).collect();
+            assert_eq!(order, ["clip", "egfx1", "egfx2", "drive", "rdpdr", "drive"]);
         }
 
         #[test]
