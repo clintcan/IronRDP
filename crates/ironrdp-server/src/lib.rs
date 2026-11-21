@@ -6,6 +6,7 @@ mod macros;
 
 // (macrdp) macrdp's own channel modules, kept alongside upstream's
 // equivalents (which stay inert: macrdp never sets their factories).
+mod audin; // (macrdp 25)
 #[cfg(feature = "multitransport")]
 mod mt;
 mod rdcamera; // (macrdp 19)
@@ -35,6 +36,11 @@ mod sound;
 #[cfg(feature = "usb")]
 mod urbdrc;
 
+// (macrdp 25)
+pub use audin::{
+    AUDIO_INPUT_CHANNEL_NAME, AudinSampleSink, AudinServer, AudinServerFactory, choose_capture_format,
+    is_acceptable_capture_format, server_input_formats,
+};
 pub use clipboard::CliprdrServerFactory;
 pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
@@ -62,6 +68,7 @@ pub use mt::dtls::DtlsServerContext;
 pub use mt::listener::{ListenerConfig, UdpMultitransportListener};
 #[cfg(feature = "multitransport")]
 pub use mt::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};
+// (macrdp 19)
 pub use rdcamera::{
     CameraSampleSink, RDCAMERA_CHANNEL_NAME, RdCameraDeviceProcessor, RdCameraServer, RdCameraServerFactory,
 };

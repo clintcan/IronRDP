@@ -20,12 +20,13 @@ use super::{
 };
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
+use crate::audin::AudinChannelFactory;
 use crate::rdcamera::RdCameraChannelFactory;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
 use crate::rdpeusb::UrbdrcChannelFactory;
 use crate::{
-    AudioWave, RdCameraServerFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory, ServerError,
-    ServerErrorExt as _, ServerResult, UrbdrcServerFactory, UrbdrcServerMessage,
+    AudinServerFactory, AudioWave, RdCameraServerFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory,
+    ServerError, ServerErrorExt as _, ServerResult, UrbdrcServerFactory, UrbdrcServerMessage,
 };
 
 // (macrdp 12) macrdp's UDP multitransport, under this module so it can extend
@@ -66,6 +67,8 @@ pub(crate) struct MacrdpChannelFactories {
     pub(crate) urbdrc: Option<Box<dyn UrbdrcServerFactory>>,
     /// (macrdp 19) MS-RDPECAM camera redirection; upstream has no server wiring for it.
     pub(crate) camera: Option<Box<dyn RdCameraServerFactory>>,
+    /// (macrdp 25) Never set together with upstream's `with_rdpeai_factory`.
+    pub(crate) audin: Option<Box<dyn AudinServerFactory>>,
 }
 
 /// (macrdp 2) Bounded to ~1 s of audio at the steady-state 42.78 waves/s
@@ -115,6 +118,17 @@ impl RdpServer {
             camera.set_sender(self.ev_sender.clone());
             self.dynamic_channel_factories
                 .push(Box::new(RdCameraChannelFactory::new(camera)));
+        }
+        // (macrdp 25) The microphone channel, after the camera as before.
+        if let Some(audin) = channels.audin {
+            if self.rdpeai_factory.is_some() {
+                warn!(
+                    "Both with_rdpeai_factory and with_audin_factory are set; the client is offered \
+                     two AUDIO_INPUT channels"
+                );
+            }
+            self.dynamic_channel_factories
+                .push(Box::new(AudinChannelFactory::new(audin)));
         }
         // No sound factory: no rdpsnd channel, so no audio arm.
         if let Some(snd) = self.sound_factory.as_mut() {
@@ -830,15 +844,36 @@ mod tests {
             }
         }
 
+        struct Mic;
+
+        impl AudinServerFactory for Mic {
+            fn build_processor(&self) -> crate::AudinServer {
+                crate::AudinServer::new(None)
+            }
+        }
+
         #[test]
-        fn the_camera_channel_is_attached_after_urbdrc() {
-            let server = server(&Arc::default());
+        fn the_camera_and_mic_channels_are_attached_after_urbdrc() {
+            let server = RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .with_audin_factory(Some(Box::new(Mic)))
+                .with_urbdrc_factory(Some(Box::new(Usb)))
+                .with_camera_factory(Some(Box::new(Camera {
+                    sender: None,
+                    sinks: Arc::default(),
+                })))
+                .build();
             let drdynvc = server
                 .dynamic_channel_factories
                 .iter()
                 .fold(DrdynvcServer::new(), |dvc, factory| factory.attach(dvc));
             let camera = drdynvc.get_channel_id_by_type::<RdCameraServer>().unwrap();
+            let mic = drdynvc.get_channel_id_by_type::<crate::AudinServer>().unwrap();
             assert!(drdynvc.get_channel_id_by_type::<UrbdrcServer>().unwrap() < camera);
+            assert!(camera < mic);
         }
 
         #[tokio::test]
