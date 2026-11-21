@@ -23,8 +23,8 @@ use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{
-    Acceptor, AcceptorResult, AcceptorState, CredentialOrigin, MultitransportSecurityRng, ReceivedCredentials,
-    RemoteAppCapabilities,
+    Acceptor, AcceptorResult, AcceptorState, ConnectTimeAutoDetectWindow, CredentialOrigin, MultitransportSecurityRng,
+    ReceivedCredentials, RemoteAppCapabilities,
 };
 pub use self::credssp::CredsspBackend;
 pub use self::finalization::{FinalizationSequence, FinalizationState};
@@ -246,17 +246,58 @@ where
 ///
 /// Panics if [`Acceptor::multitransport_soft_sync_negotiated`] returns `None` for an existing multitransport request.
 pub async fn accept_finalize_with_handlers<S, H, M>(
-    mut framed: Framed<S>,
+    framed: Framed<S>,
     acceptor: &mut Acceptor,
     credentials_handler: &mut H,
-    mut multitransport_handler: M,
+    multitransport_handler: M,
 ) -> ConnectorResult<(Framed<S>, AcceptorResult)>
 where
     S: FramedRead + FramedWrite,
     H: ConnectionSetupHandler,
     M: AsyncFnMut(ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu, bool),
 {
+    // (macrdp divergence 7)
+    accept_finalize_with_hooks(
+        framed,
+        acceptor,
+        credentials_handler,
+        multitransport_handler,
+        async |_, _| Ok(()),
+    )
+    .await
+}
+
+/// (macrdp divergence 7) [`accept_finalize_with_handlers`], and also calls
+/// `autodetect_handler` once, at the window for Optional Connect-Time
+/// Auto-Detection ([`Acceptor::connect_time_autodetect_window`]): after the
+/// Client Info PDU and its credentials have been handled, before the acceptor
+/// sends its first licensing PDU. The handler may exchange auto-detect PDUs
+/// with the client on `framed`; it runs inside this future, so any timeout the
+/// caller puts around the finalize sequence bounds it too. An error from the
+/// handler ends the sequence.
+///
+/// # Panics
+///
+/// As [`accept_finalize_with_handlers`].
+pub async fn accept_finalize_with_hooks<S, H, M, A>(
+    mut framed: Framed<S>,
+    acceptor: &mut Acceptor,
+    credentials_handler: &mut H,
+    mut multitransport_handler: M,
+    mut autodetect_handler: A,
+) -> ConnectorResult<(Framed<S>, AcceptorResult)>
+where
+    S: FramedRead + FramedWrite,
+    H: ConnectionSetupHandler,
+    M: AsyncFnMut(ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu, bool),
+    A: AsyncFnMut(&mut Framed<S>, ConnectTimeAutoDetectWindow) -> ConnectorResult<()>,
+{
     let mut buf = WriteBuf::new();
+    // (macrdp divergence 7) At most once per call: a deactivation-reactivation
+    // never opens the window (see `connect_time_autodetect_window`), so this
+    // only guards against the acceptor staying in the window across loop
+    // iterations.
+    let mut autodetect_done = false;
     // `multitransport_request()` borrows rather than consumes (the field it
     // reads also gates `CapabilitiesWaitConfirm`'s tolerance for a late
     // Initiate Multitransport Response), so this driver tracks locally
@@ -274,6 +315,12 @@ where
     loop {
         if let Some(result) = acceptor.get_result() {
             return Ok((framed, result));
+        }
+
+        // (macrdp divergence 7)
+        if !autodetect_done && let Some(window) = acceptor.connect_time_autodetect_window() {
+            autodetect_done = true;
+            autodetect_handler(&mut framed, window).await?;
         }
 
         acceptor_step(&mut framed, acceptor, &mut buf).await?;

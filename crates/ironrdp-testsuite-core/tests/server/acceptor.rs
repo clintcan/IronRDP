@@ -2577,3 +2577,53 @@ async fn native_credssp_rejects_a_different_tls_public_key() {
     assert!(result.is_err());
     assert!(handler.received.is_empty());
 }
+
+// (macrdp divergence 7) `Acceptor::connect_time_autodetect_window`.
+
+fn autodetect_gcc(
+    early_capability: ClientEarlyCapabilityFlags,
+    message_channel: bool,
+) -> ironrdp_pdu::gcc::ClientGccBlocks {
+    let mut blocks = client_gcc_with_message_channel_and_multitransport(None);
+    if !message_channel {
+        blocks.message_channel = None;
+    }
+    blocks.core.optional_data.early_capability_flags = Some(early_capability);
+    blocks
+}
+
+/// The window opens after the Client Info PDU, before licensing, with the
+/// channel ids the acceptor assigned, and closes once licensing is sent.
+#[test]
+fn connect_time_autodetect_window_is_between_client_info_and_licensing() {
+    let mut acceptor = multitransport_acceptor(None);
+    let blocks = autodetect_gcc(ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT, true);
+    let (user_channel_id, _io, message_channel_id, _) = drive_to_secure_settings_exchange(&mut acceptor, blocks);
+    let window = acceptor
+        .connect_time_autodetect_window()
+        .expect("window open after Client Info");
+    assert_eq!(window.message_channel_id, message_channel_id.expect("message channel"));
+    assert_eq!(window.user_channel_id, user_channel_id);
+
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
+    assert_eq!(acceptor.connect_time_autodetect_window(), None);
+}
+
+/// No window when the client did not advertise SUPPORT_NET_CHAR_AUTODETECT.
+#[test]
+fn connect_time_autodetect_window_needs_the_client_flag() {
+    let mut acceptor = multitransport_acceptor(None);
+    let blocks = autodetect_gcc(ClientEarlyCapabilityFlags::empty(), true);
+    drive_to_secure_settings_exchange(&mut acceptor, blocks);
+    assert_eq!(acceptor.connect_time_autodetect_window(), None);
+}
+
+/// No window when the client did not join the MCS message channel.
+#[test]
+fn connect_time_autodetect_window_needs_the_message_channel() {
+    let mut acceptor = multitransport_acceptor(None);
+    let blocks = autodetect_gcc(ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT, false);
+    let (.., message_channel_id, _) = drive_to_secure_settings_exchange(&mut acceptor, blocks);
+    assert_eq!(message_channel_id, None);
+    assert_eq!(acceptor.connect_time_autodetect_window(), None);
+}
