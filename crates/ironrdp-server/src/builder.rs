@@ -591,6 +591,8 @@ impl RdpServerBuilder<BuilderDone> {
         #[cfg(feature = "egfx")]
         server.set_egfx_core_frame_ack_limit(self.state.egfx_core_frame_ack_limit);
         server.set_connection_binder(self.state.connection_binder);
+        // (macrdp 2)
+        server.install_macrdp_channels();
         server
     }
 }

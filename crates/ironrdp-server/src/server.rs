@@ -83,6 +83,11 @@ use crate::{RdpdrServerFactory, SoundServerFactory, builder, capabilities};
 #[cfg(feature = "usb")]
 use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::UrbdrcDeviceServer};
 
+// (macrdp) macrdp's additions, kept out of this file. A child module, so it
+// reaches `RdpServer`'s private fields without widening them.
+#[path = "macrdp.rs"]
+mod macrdp;
+
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
@@ -1515,6 +1520,8 @@ pub struct RdpServer {
     /// frame window; see [`Self::set_egfx_core_frame_ack_limit`].
     #[cfg(feature = "egfx")]
     egfx_core_frame_ack_limit: bool,
+    /// (macrdp) Everything macrdp adds per server, in one place.
+    macrdp: macrdp::MacrdpServerState,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -3296,6 +3303,7 @@ impl RdpServer {
             logon_notification_on_request: false,
             #[cfg(feature = "egfx")]
             egfx_core_frame_ack_limit: false,
+            macrdp: macrdp::MacrdpServerState::default(),
         }
     }
 
@@ -4005,6 +4013,9 @@ impl RdpServer {
         for event in keep {
             let _ = self.ev_sender.send(event);
         }
+
+        // (macrdp 2) The replaced session's audio rides its own channel.
+        self.discard_stale_macrdp_audio();
     }
 
     /// Build the cheap, cloned snapshot a preempting candidate negotiates
@@ -6176,6 +6187,9 @@ impl RdpServer {
         let mut reply_writer = writer.for_replies();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let mut ev_receiver = ev_receiver.lock().await;
+        // (macrdp 2/3/8) Audio from macrdp's own bounded channel.
+        let macrdp_audio_receiver = self.macrdp_audio_receiver();
+        let mut macrdp_audio = macrdp::AudioDispatch::new(macrdp_audio_receiver.as_deref()).await;
         let mut buffer = vec![0u8; 4096];
         let mut events = Vec::with_capacity(100);
 
@@ -6301,6 +6315,12 @@ impl RdpServer {
                         tracing::trace!(batch_size, dispatch_ms, "Dispatched server event batch");
                     }
                     ConnectionIteration::state(result)
+                }
+                // (macrdp 2/3/8) One wave at a time, not gated on `queue_idle`:
+                // see `macrdp::AudioDispatch`.
+                wave = macrdp_audio.next_wave(), if macrdp_audio.is_open() => {
+                    macrdp_audio.dispatch(conn, &mut writer, user_channel_id, wave)?;
+                    ConnectionIteration::state(RunState::Continue)
                 }
                 _ = cookie_interval.tick() => {
                     self.rotate_auto_reconnect_cookie(conn, &mut writer, io_channel_id, user_channel_id)
