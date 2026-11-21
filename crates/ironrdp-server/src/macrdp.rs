@@ -16,9 +16,10 @@ use super::{ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, WriteCom
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
+use crate::rdpeusb::UrbdrcChannelFactory;
 use crate::{
     AudioWave, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory, ServerError, ServerErrorExt as _,
-    ServerResult,
+    ServerResult, UrbdrcServerFactory, UrbdrcServerMessage,
 };
 
 // (macrdp 12) macrdp's UDP multitransport, under this module so it can extend
@@ -55,6 +56,8 @@ pub(super) struct MacrdpConnectionState {
 #[derive(Default)]
 pub(crate) struct MacrdpChannelFactories {
     pub(crate) rdpdr_drive: Option<Box<dyn RdpdrDriveServerFactory>>,
+    /// (macrdp 16) Never set together with upstream's `with_usb_factory`.
+    pub(crate) urbdrc: Option<Box<dyn UrbdrcServerFactory>>,
 }
 
 /// (macrdp 2) Bounded to ~1 s of audio at the steady-state 42.78 waves/s
@@ -86,6 +89,19 @@ impl RdpServer {
         // (macrdp 12) The dual audio DVCs, through upstream's dynamic channel factories.
         #[cfg(feature = "multitransport")]
         self.install_mt_channels();
+        // (macrdp 16) The main URBDRC channel, after the audio DVCs as before.
+        if let Some(mut urbdrc) = channels.urbdrc {
+            #[cfg(feature = "usb")]
+            if self.usb_factory.is_some() {
+                warn!(
+                    "Both with_usb_factory and with_urbdrc_factory are set; the client is offered \
+                     two URBDRC channels"
+                );
+            }
+            urbdrc.set_sender(self.ev_sender.clone());
+            self.dynamic_channel_factories
+                .push(Box::new(UrbdrcChannelFactory::new(urbdrc)));
+        }
         // No sound factory: no rdpsnd channel, so no audio arm.
         if let Some(snd) = self.sound_factory.as_mut() {
             let (audio_sender, audio_receiver) = mpsc::channel::<AudioWave>(AUDIO_CHANNEL_CAPACITY);
@@ -413,6 +429,37 @@ pub(super) async fn dispatch_rdpdr_drive(
         .map_err(|e| ServerError::io("write_all", e))
 }
 
+/// (macrdp 16) Ships a [`UsbHandle`](crate::UsbHandle)'s transfer on its open
+/// per-device channel. An encode error drops that transfer instead of ending the
+/// session: a URB the codec rejects must not kill an opt-in feature's connection
+/// (the same principle as the URBDRC `process()` decode tolerance). A socket error
+/// stays fatal.
+pub(super) async fn dispatch_urbdrc(
+    conn: &mut ConnectionState,
+    writer: &mut QueuedWriter,
+    user_channel_id: u16,
+    message: UrbdrcServerMessage,
+) -> ServerResult<()> {
+    let UrbdrcServerMessage::SendMessages { channel_id, messages } = message;
+    let Some(drdynvc_channel_id) = conn.get_channel_id_by_type::<ironrdp_dvc::DrdynvcServer>() else {
+        warn!("No DRDYNVC channel, dropping URBDRC transfer");
+        return Ok(());
+    };
+    let data = match ironrdp_dvc::encode_dvc_messages(channel_id, messages, ironrdp_svc::ChannelFlags::empty())
+        .and_then(|m| server_encode_svc_messages(m, drdynvc_channel_id, user_channel_id))
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "URBDRC: failed to encode a transfer request; dropping it (session kept alive)");
+            return Ok(());
+        }
+    };
+    writer
+        .write_all(&data)
+        .await
+        .map_err(|e| ServerError::io("write_all", e))
+}
+
 /// (macrdp 4) Reorders one event batch into three tiers: CLIPRDR, then EGFX
 /// video and everything else, then RDPDR, since all of them share the one
 /// outbound queue.
@@ -455,6 +502,177 @@ mod tests {
     // Imported above only with `egfx`.
     #[cfg(not(feature = "egfx"))]
     use crate::ServerEvent;
+
+    mod urbdrc {
+        use core::any::TypeId;
+        use std::rc::Rc;
+
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::pdu::{
+            CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DataPdu, DrdynvcClientPdu,
+            DrdynvcDataPdu, DrdynvcServerPdu,
+        };
+        use ironrdp_dvc::{DrdynvcServer, DvcMessage};
+        use ironrdp_rdpeusb::pdu::sink::AddVirtualChannel;
+        use ironrdp_svc::{ChannelFlags, SvcMessage, SvcProcessor as _};
+
+        use super::super::super::OutboundQueue;
+        use super::*;
+        use crate::{URBDRC_CHANNEL_NAME, UrbdrcServer, UsbDeviceCallback};
+
+        const DRDYNVC_CHANNEL_ID: u16 = 1005;
+        const USER_CHANNEL_ID: u16 = 1002;
+
+        struct Factory(Option<mpsc::UnboundedSender<ServerEvent>>);
+
+        impl crate::ServerEventSender for Factory {
+            fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+                self.0 = Some(sender);
+            }
+        }
+
+        impl UrbdrcServerFactory for Factory {
+            fn build_processor(&self) -> UrbdrcServer {
+                UrbdrcServer::with_sender(self.0.clone())
+            }
+
+            fn device_callback(&self) -> Option<UsbDeviceCallback> {
+                Some(Arc::new(|_| {}))
+            }
+        }
+
+        fn server() -> RdpServer {
+            RdpServer::builder()
+                .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+                .with_no_security()
+                .with_no_input()
+                .with_no_display()
+                .with_urbdrc_factory(Some(Box::new(Factory(None))))
+                .build()
+        }
+
+        /// DRDYNVC with every channel opened through the caps and create handshake.
+        fn opened_drdynvc(server: &RdpServer) -> DrdynvcServer {
+            let mut drdynvc = server
+                .dynamic_channel_factories
+                .iter()
+                .fold(DrdynvcServer::new(), |dvc, factory| factory.attach(dvc));
+            drdynvc.start().unwrap();
+            let caps = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+                CapsVersion::V2,
+            )))
+            .unwrap();
+            for create in drdynvc.process(&caps).unwrap() {
+                let DrdynvcServerPdu::Create(create) =
+                    ironrdp_core::decode::<DrdynvcServerPdu>(&create.encode_unframed_pdu().unwrap()).unwrap()
+                else {
+                    panic!("expected a Create Request");
+                };
+                let response = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+                    create.channel_id(),
+                    CreationStatus::OK,
+                )))
+                .unwrap();
+                drdynvc.process(&response).unwrap();
+            }
+            drdynvc
+        }
+
+        #[test]
+        fn the_urbdrc_channel_is_attached_after_the_audio_dvcs() {
+            #[cfg_attr(not(feature = "multitransport"), expect(unused_mut))]
+            let mut server = server();
+            #[cfg(feature = "multitransport")]
+            server.set_multitransport_lossy_audio_formats(Some(vec![ironrdp_rdpsnd::pdu::AudioFormat {
+                format: ironrdp_rdpsnd::pdu::WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44_100,
+                n_avg_bytes_per_sec: 176_400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            }]));
+            let expected = if cfg!(feature = "multitransport") { 2 } else { 1 };
+            assert_eq!(server.dynamic_channel_factories.len(), expected);
+            let drdynvc = server
+                .dynamic_channel_factories
+                .iter()
+                .fold(DrdynvcServer::new(), |dvc, factory| factory.attach(dvc));
+            let urbdrc = drdynvc.get_channel_id_by_type::<UrbdrcServer>().unwrap();
+            #[cfg(feature = "multitransport")]
+            assert!(
+                drdynvc
+                    .get_channel_id_by_type::<crate::mt::audio_dvc::AudioLossyDvc>()
+                    .unwrap()
+                    < urbdrc
+            );
+            let _ = urbdrc;
+        }
+
+        #[tokio::test]
+        async fn a_device_channel_and_its_transfers_reach_the_wire() {
+            let mut server = server();
+            let mut drdynvc = opened_drdynvc(&server);
+            let urbdrc = drdynvc.get_channel_id_by_type::<UrbdrcServer>().unwrap();
+
+            // The client announces a device on the main channel.
+            let announce = encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+                urbdrc,
+                encode_vec(&AddVirtualChannel { msg_id: 1 }).unwrap(),
+            ))))
+            .unwrap();
+            assert!(drdynvc.process(&announce).unwrap().is_empty());
+
+            let mut conn = ConnectionState::default();
+            conn.static_channels.insert(drdynvc);
+            conn.static_channels
+                .attach_channel_id(TypeId::of::<DrdynvcServer>(), DRDYNVC_CHANNEL_ID);
+            let mut events = Vec::new();
+            {
+                let mut receiver = server.ev_receiver.lock().await;
+                while let Ok(event) = receiver.try_recv() {
+                    events.push(event);
+                }
+            }
+            assert_eq!(events.len(), 1);
+            assert!(matches!(events[0], ServerEvent::CreateDynamicChannel(_)));
+            let transfer: DvcMessage = Box::new(AddVirtualChannel { msg_id: 2 });
+            events.push(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: 77,
+                messages: vec![transfer],
+            }));
+
+            let queue = Rc::new(OutboundQueue::default());
+            let mut writer = QueuedWriter::new(Rc::clone(&queue));
+            server
+                .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, USER_CHANNEL_ID, None, None)
+                .await
+                .unwrap();
+
+            // URBDRC is the last channel registered, so the device gets the next id.
+            let device = urbdrc + 1;
+            let create = SvcMessage::from(DrdynvcServerPdu::Create(ironrdp_dvc::pdu::CreateRequestPdu::new(
+                device,
+                URBDRC_CHANNEL_NAME.into(),
+            )))
+            .with_flags(ChannelFlags::SHOW_PROTOCOL);
+            let mut expected = server_encode_svc_messages(vec![create], DRDYNVC_CHANNEL_ID, USER_CHANNEL_ID).unwrap();
+            let transfer = ironrdp_dvc::encode_dvc_messages(
+                77,
+                vec![Box::new(AddVirtualChannel { msg_id: 2 })],
+                ChannelFlags::empty(),
+            )
+            .unwrap();
+            expected.extend(server_encode_svc_messages(transfer, DRDYNVC_CHANNEL_ID, USER_CHANNEL_ID).unwrap());
+            let written: Vec<u8> = queue
+                .pending
+                .borrow()
+                .iter()
+                .flat_map(|pdu| pdu.bytes.iter().copied())
+                .collect();
+            assert_eq!(written, expected);
+        }
+    }
 
     mod link_rtt {
         use super::super::super::{ConnectionSource, IncomingConnection, NextConnection, TcpConnectionSource};

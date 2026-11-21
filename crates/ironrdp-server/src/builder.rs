@@ -294,6 +294,15 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// (macrdp 16) Configure macrdp's server-direction MS-RDPEUSB (USB
+    /// redirection) channel, driven through the
+    /// [`UrbdrcServerFactory`](crate::UrbdrcServerFactory)-built DVC processor.
+    /// Don't combine with the `usb` feature's `with_usb_factory`: both register `URBDRC`.
+    pub fn with_urbdrc_factory(mut self, factory: Option<Box<dyn crate::UrbdrcServerFactory>>) -> Self {
+        self.state.macrdp_channels.urbdrc = factory;
+        self
+    }
+
     /// Configure MS-RDPEAI (audio input / microphone redirection over a dynamic channel).
     pub fn with_rdpeai_factory(mut self, rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>) -> Self {
         self.state.rdpeai_factory = rdpeai_factory;
