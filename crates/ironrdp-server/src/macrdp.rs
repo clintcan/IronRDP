@@ -11,7 +11,7 @@ use rdpsnd::server::RdpsndServer;
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 
-use super::{ConnectionState, QueuedWriter, RdpServer, WriteCompletion, rdpsnd};
+use super::{ConnectionOutput, ConnectionState, QueuedWriter, RdpServer, WriteCompletion, rdpsnd};
 #[cfg(feature = "egfx")]
 use crate::ServerEvent;
 use crate::rdpdr_drive::RdpdrDriveChannelFactory;
@@ -20,11 +20,29 @@ use crate::{
     ServerResult,
 };
 
+// (macrdp 12) macrdp's UDP multitransport, under this module so it can extend
+// `RdpServer` and `ConnectionState`.
+#[cfg(feature = "multitransport")]
+#[path = "mt/session.rs"]
+mod mt_session;
+
 /// (macrdp) Per-server state for macrdp's divergences, in one `RdpServer` field.
 #[derive(Default)]
 pub(super) struct MacrdpServerState {
     /// (2/8) Dedicated audio channel, read by the client loop's audio arm.
     audio_receiver: Option<Arc<Mutex<mpsc::Receiver<AudioWave>>>>,
+    /// (12) macrdp's UDP multitransport: its configuration.
+    #[cfg(feature = "multitransport")]
+    mt: mt_session::MtState,
+}
+
+/// (macrdp) Per-connection state for macrdp's divergences, in one `ConnectionState`
+/// field. Dropped with the connection's state.
+#[cfg(feature = "multitransport")]
+#[derive(Default)]
+pub(super) struct MacrdpConnectionState {
+    /// (12) macrdp's UDP multitransport: this connection's offer, tunnel and routing.
+    mt: mt_session::MtConnection,
 }
 
 /// (macrdp 11) macrdp's own channel factories, set on the builder and handed to
@@ -62,6 +80,9 @@ impl RdpServer {
             self.static_channel_factories
                 .push(Box::new(RdpdrDriveChannelFactory::new(rdpdr, self.ev_sender.clone())));
         }
+        // (macrdp 12) The dual audio DVCs, through upstream's dynamic channel factories.
+        #[cfg(feature = "multitransport")]
+        self.install_mt_channels();
         // No sound factory: no rdpsnd channel, so no audio arm.
         if let Some(snd) = self.sound_factory.as_mut() {
             let (audio_sender, audio_receiver) = mpsc::channel::<AudioWave>(AUDIO_CHANNEL_CAPACITY);
@@ -158,6 +179,14 @@ impl<'a> AudioDispatch<'a> {
         if !self.lag.admit(Instant::now(), wave_ms) {
             return Ok(());
         }
+        // (macrdp 12) The lossy tunnel takes the wave once that path is live; static
+        // RDPSND stays silent then (no double play). The permit drops here, so the
+        // next wave is not held back.
+        #[cfg(feature = "multitransport")]
+        let Some(data) = conn.mt_route_lossy_audio(data, ts) else {
+            self.lag.shipped(wave_ms);
+            return Ok(());
+        };
         let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
             warn!("No rdpsnd channel, dropping wave");
             return Ok(());
@@ -188,6 +217,70 @@ impl<'a> AudioDispatch<'a> {
         // counting it now gives the model the same view as counting it then.
         self.lag.shipped(wave_ms);
         Ok(())
+    }
+}
+
+/// (macrdp 12) The client loop's arm for client-to-server data from macrdp's
+/// tunnel (e.g. EGFX frame acks once EGFX migrated). Closed when there's no
+/// tunnel, and always without the `multitransport` feature.
+///
+/// Taken from the connection's state when the client loop starts, so a
+/// deactivation-reactivation pass ends it, as the old fork's per-loop future did.
+pub(super) struct TunnelInbound {
+    #[cfg(feature = "multitransport")]
+    receiver: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+}
+
+impl TunnelInbound {
+    pub(super) fn take(conn: &mut ConnectionState) -> Self {
+        #[cfg(not(feature = "multitransport"))]
+        let _ = conn;
+        Self {
+            #[cfg(feature = "multitransport")]
+            receiver: conn.mt_take_tunnel_inbound(),
+        }
+    }
+
+    /// Whether the arm has a receiver to read.
+    #[cfg_attr(
+        not(feature = "multitransport"),
+        expect(clippy::unused_self, reason = "no tunnel without the feature")
+    )]
+    pub(super) fn is_open(&self) -> bool {
+        #[cfg(feature = "multitransport")]
+        return self.receiver.is_some();
+        #[cfg(not(feature = "multitransport"))]
+        false
+    }
+
+    /// The next PDU. `None`: the listener dropped its sender. Cancel safe.
+    pub(super) async fn recv(&mut self) -> Option<Vec<u8>> {
+        #[cfg(feature = "multitransport")]
+        if let Some(receiver) = self.receiver.as_mut() {
+            return receiver.recv().await;
+        }
+        core::future::pending().await
+    }
+
+    /// Processes one PDU from [`Self::recv`].
+    #[cfg_attr(
+        not(feature = "multitransport"),
+        expect(clippy::unused_self, reason = "no tunnel without the feature")
+    )]
+    pub(super) fn process(&mut self, conn: &mut ConnectionState, pdu: Option<Vec<u8>>) -> Vec<ConnectionOutput> {
+        #[cfg(feature = "multitransport")]
+        {
+            let Some(pdu) = pdu else {
+                self.receiver = None;
+                return Vec::new();
+            };
+            conn.mt_process_tunnel_inbound(&pdu)
+        }
+        #[cfg(not(feature = "multitransport"))]
+        {
+            let _ = (conn, pdu);
+            Vec::new()
+        }
     }
 }
 

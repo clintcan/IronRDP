@@ -2369,6 +2369,9 @@ struct ConnectionState {
     /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
     pointer_cache_size: u16,
     color_pointer_cache_size: u16,
+    /// (macrdp 12) Everything macrdp adds per connection, in one place.
+    #[cfg(feature = "multitransport")]
+    macrdp: macrdp::MacrdpConnectionState,
 }
 
 /// What the client asked for in its logon notification; see [`RdpServer::send_logon_notification`].
@@ -2556,7 +2559,11 @@ impl ConnectionState {
                     return self.handle_io_channel_data(data);
                 }
                 if Some(data.channel_id) == context.message_channel_id {
-                    return Ok(self.handle_message_channel_data(context.now_ms, data));
+                    let outputs = self.handle_message_channel_data(context.now_ms, data);
+                    // (macrdp 12) The empty Soft-Sync a successful response may owe.
+                    #[cfg(feature = "multitransport")]
+                    let outputs = self.mt_with_owed_soft_sync(outputs, context.user_channel_id)?;
+                    return Ok(outputs);
                 }
                 let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) else {
                     warn!(channel_id = data.channel_id, "Unexpected channel received");
@@ -2764,6 +2771,9 @@ impl ConnectionState {
                     self.udp_migration_allowed = true;
                     debug!("Multitransport confirmed after finalization, EGFX may migrate to UDP");
                 }
+                // (macrdp 12)
+                #[cfg(feature = "multitransport")]
+                self.mt_on_response(&pdu);
             }
             Err(error) => {
                 warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
@@ -3939,6 +3949,9 @@ impl RdpServer {
             pending_logon_notification: None,
             pointer_cache_size: 0,
             color_pointer_cache_size: 0,
+            // (macrdp 12)
+            #[cfg(feature = "multitransport")]
+            macrdp: macrdp::MacrdpConnectionState::default(),
         }
     }
 
@@ -4265,6 +4278,9 @@ impl RdpServer {
             },
         );
         pending.acceptor.set_credssp_backend(self.credssp_backend);
+        // (macrdp 12) macrdp's own UDP offer.
+        #[cfg(feature = "multitransport")]
+        self.mt_offer(&mut pending.acceptor);
         pending
     }
 
@@ -5791,6 +5807,12 @@ impl RdpServer {
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
                     EgfxServerMessage::SendMessages { messages } => {
+                        // (macrdp 12) Once EGFX has migrated, it rides macrdp's
+                        // tunnel instead of TCP.
+                        #[cfg(feature = "multitransport")]
+                        let Some(messages) = conn.mt_route_egfx(messages)? else {
+                            continue;
+                        };
                         self.dispatch_egfx_messages(
                             conn,
                             messages,
@@ -5800,6 +5822,8 @@ impl RdpServer {
                             udp_transport,
                         )
                         .await?;
+                        #[cfg(feature = "multitransport")]
+                        conn.mt_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
@@ -6202,6 +6226,8 @@ impl RdpServer {
         // (macrdp 2/3/8) Audio from macrdp's own bounded channel.
         let macrdp_audio_receiver = self.macrdp_audio_receiver();
         let mut macrdp_audio = macrdp::AudioDispatch::new(macrdp_audio_receiver.as_deref()).await;
+        // (macrdp 12) Client-to-server data from macrdp's tunnel.
+        let mut macrdp_tunnel = macrdp::TunnelInbound::take(conn);
         let mut buffer = vec![0u8; 4096];
         let mut events = Vec::with_capacity(100);
 
@@ -6333,6 +6359,10 @@ impl RdpServer {
                 wave = macrdp_audio.next_wave(), if macrdp_audio.is_open() => {
                     macrdp_audio.dispatch(conn, &mut writer, user_channel_id, wave)?;
                     ConnectionIteration::state(RunState::Continue)
+                }
+                // (macrdp 12) Replies go back over the tunnel, not the queue.
+                pdu = macrdp_tunnel.recv(), if macrdp_tunnel.is_open() => {
+                    ConnectionIteration::outputs(macrdp_tunnel.process(conn, pdu))
                 }
                 _ = cookie_interval.tick() => {
                     self.rotate_auto_reconnect_cookie(conn, &mut writer, io_channel_id, user_channel_id)
@@ -6930,6 +6960,9 @@ impl RdpServer {
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
         let mut conn = self.attach_channels(&mut acceptor).await;
+        // (macrdp 12)
+        #[cfg(feature = "multitransport")]
+        self.mt_begin_connection(&mut conn);
         let udp_bind_addr = self
             .opts
             .udp_bind_addr
@@ -7000,6 +7033,10 @@ impl RdpServer {
                     ));
                 }
             };
+
+            // (macrdp 12)
+            #[cfg(feature = "multitransport")]
+            conn.mt_on_finalized(&acceptor, result.reactivation);
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 

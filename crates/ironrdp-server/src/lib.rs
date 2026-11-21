@@ -6,6 +6,8 @@ mod macros;
 
 // (macrdp) macrdp's own channel modules, kept alongside upstream's
 // equivalents (which stay inert: macrdp never sets their factories).
+#[cfg(feature = "multitransport")]
+mod mt;
 mod rdpdr_drive;
 
 pub mod autodetect;
@@ -52,6 +54,12 @@ pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
 pub use ironrdp_rdpeusb::io::{CompletionData, DeviceText, InternalIoControlPacket};
+#[cfg(feature = "multitransport")]
+pub use mt::dtls::DtlsServerContext;
+#[cfg(feature = "multitransport")]
+pub use mt::listener::{ListenerConfig, UdpMultitransportListener};
+#[cfg(feature = "multitransport")]
+pub use mt::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
 pub use rdpdr_drive::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrDriveMessage, RdpdrDriveServer, RdpdrDriveServerFactory,
