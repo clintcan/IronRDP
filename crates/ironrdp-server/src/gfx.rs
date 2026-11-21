@@ -7,6 +7,7 @@
 //! so the display handler can call `send_avc420_frame()` proactively while the
 //! DVC infrastructure handles client messages (capability negotiation, frame acks).
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ironrdp_core::impl_as_any;
@@ -76,11 +77,33 @@ pub(crate) fn build_server_and_handle(
 /// enabling shared access from both the DVC layer and the display handler.
 pub struct GfxDvcBridge {
     inner: GfxServerHandle,
+    /// (macrdp divergence 14) Optional "decline the graphics pipeline" flag, set by the application's
+    /// `GraphicsPipelineHandler` (synchronously during `process` — the inner
+    /// server invokes the handler before returning). When true, `process`
+    /// discards the inner server's output instead of shipping it — most
+    /// importantly the `CapabilitiesConfirm`, so a client whose advertised
+    /// capabilities the application can't serve (e.g. EGFX offered but AVC
+    /// disabled on every capset) is never told the pipeline is active and
+    /// keeps rendering legacy updates. Confirming caps and then sending legacy
+    /// updates anyway is a protocol violation some clients (Windows App for
+    /// Android) hard-disconnect on. `None` = never decline (default).
+    decline_output: Option<Arc<AtomicBool>>,
 }
 
 impl GfxDvcBridge {
     pub fn new(server: GfxServerHandle) -> Self {
-        Self { inner: server }
+        Self {
+            inner: server,
+            decline_output: None,
+        }
+    }
+
+    /// Like [`Self::new`] but with a shared decline flag (see the field note).
+    pub fn with_decline_flag(server: GfxServerHandle, decline: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: server,
+            decline_output: Some(decline),
+        }
     }
 
     pub fn server(&self) -> &GfxServerHandle {
@@ -110,10 +133,21 @@ impl DvcProcessor for GfxDvcBridge {
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        self.inner
+        let out = self
+            .inner
             .lock()
             .expect("GfxServerHandle mutex poisoned")
-            .process(channel_id, payload)
+            .process(channel_id, payload)?;
+        // The handler ran synchronously inside `process` above, so the decline
+        // flag is current for the PDU just handled. Discarding the output here
+        // (rather than not processing) keeps the inner server's state machine
+        // consistent while the client is never told the pipeline came up.
+        if let Some(declined) = &self.decline_output
+            && declined.load(Ordering::Relaxed)
+        {
+            return Ok(Vec::new());
+        }
+        Ok(out)
     }
 
     fn close(&mut self, channel_id: u32) {
@@ -204,5 +238,48 @@ mod tests {
         assert!(egfx_channel_id(&direct).is_some());
 
         assert!(egfx_channel_id(&DrdynvcServer::new()).is_none());
+    }
+
+    // (macrdp 14) A handler that sets the decline flag while it sees the advertise.
+    struct DecliningHandler(Arc<AtomicBool>);
+
+    impl GraphicsPipelineHandler for DecliningHandler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+
+    fn caps_advertise() -> Vec<u8> {
+        use ironrdp_egfx::pdu::{CapabilitiesV8Flags, GfxPdu};
+
+        let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        }]));
+        ironrdp_core::encode_vec(&pdu).expect("encode CapabilitiesAdvertise")
+    }
+
+    #[test]
+    fn a_declined_pipeline_sends_no_capabilities_confirm() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let server = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(DecliningHandler(
+            Arc::clone(&flag),
+        )))));
+        let mut bridge = GfxDvcBridge::with_decline_flag(server, Arc::clone(&flag));
+        let out = bridge.process(1, &caps_advertise()).expect("process");
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(out.is_empty(), "the CapabilitiesConfirm must be discarded");
+    }
+
+    #[test]
+    fn without_a_decline_the_capabilities_are_confirmed() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let server = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Handler))));
+        let mut bridge = GfxDvcBridge::with_decline_flag(Arc::clone(&server), Arc::clone(&flag));
+        assert!(!bridge.process(1, &caps_advertise()).expect("process").is_empty());
+
+        let mut plain = GfxDvcBridge::new(Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Handler)))));
+        assert!(!plain.process(1, &caps_advertise()).expect("process").is_empty());
     }
 }
