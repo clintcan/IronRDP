@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use ironrdp_acceptor::AcceptorResult;
 use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
+use ironrdp_pdu::rdp::client_info::ClientAutoReconnect;
 use ironrdp_svc::server_encode_svc_messages;
 use ironrdp_tokio::FramedWrite as _;
 use rdpsnd::server::RdpsndServer;
@@ -159,6 +160,31 @@ impl RdpServer {
     /// (macrdp 2) The audio channel's receiver, for [`AudioDispatch::new`].
     pub(super) fn macrdp_audio_receiver(&self) -> Option<Arc<Mutex<mpsc::Receiver<AudioWave>>>> {
         self.macrdp.audio_receiver.clone()
+    }
+
+    /// (macrdp 30) Whether `client_accepted` treats the client's auto-reconnect
+    /// cookie as unknown and continues with a normal logon instead of denying it.
+    ///
+    /// MS-RDPBCGR 3.3.5.3.11: "If logon with the cookie fails, the credentials
+    /// supplied in the Client Info PDU SHOULD be used". A cookie issued before a
+    /// server restart never verifies, and FreeRDP keeps presenting it on every
+    /// retry, so denying it looped the client and, in macrdp, tripped the auth
+    /// lockout for its address.
+    ///
+    /// The fallback grants nothing extra. The acceptor skipped the credential
+    /// validator for the Client Info credentials, because the client sent a cookie;
+    /// so with a validator set, the "credentials were not prepared" check in
+    /// `client_accepted` still denies a fallback that CredSSP did not validate.
+    /// With a connection binder the binding never ran, so upstream's denial stays.
+    pub(super) fn is_stale_reconnect_cookie(&self, reconnect: Option<&ClientAutoReconnect>) -> bool {
+        let stale = reconnect.is_some_and(|reconnect| !self.verify_auto_reconnect_cookie(reconnect))
+            && self.connection_binder.is_none();
+        if stale {
+            info!(
+                "Auto-reconnect cookie not recognized (issued before a restart, or rotated out); continuing with a normal logon"
+            );
+        }
+        stale
     }
 
     /// (macrdp 15) Install a cell the server fills with each accepted

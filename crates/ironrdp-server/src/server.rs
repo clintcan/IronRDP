@@ -6573,7 +6573,9 @@ impl RdpServer {
             macrdp::report_client_fingerprint(self.connection_handler.as_ref(), &result);
         }
 
-        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
+        // (macrdp 30) A cookie that fails verification falls back to a normal logon.
+        let stale_cookie = self.is_stale_reconnect_cookie(result.auto_reconnect.as_ref());
+        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref().filter(|_| !stale_cookie) {
             if !self.verify_auto_reconnect_cookie(reconnect) {
                 warn!("Auto-reconnect cookie validation rejected");
                 send_access_denied(acceptor, writer).await?;

@@ -10,6 +10,7 @@ mod dynamic_channel_factory;
 mod echo;
 mod fast_path;
 mod finalize_timeout;
+mod macrdp_auto_reconnect; // (macrdp 30)
 mod max_request_size;
 mod multitransport_finalize;
 mod negotiation_timeout;
