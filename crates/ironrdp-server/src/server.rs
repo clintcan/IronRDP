@@ -1849,6 +1849,8 @@ pub enum ServerEvent {
     Usb(UrbdrcServerMessage),
     /// (macrdp 11) macrdp's own RDPDR drive + smart card channel.
     RdpdrDrive(crate::RdpdrDriveMessage),
+    /// (macrdp 16) macrdp's own URBDRC USB channel.
+    Urbdrc(crate::UrbdrcServerMessage),
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1911,6 +1913,8 @@ impl fmt::Debug for ServerEvent {
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
             // (macrdp 11)
             Self::RdpdrDrive(..) => f.write_str("RdpdrDrive(..)"),
+            // (macrdp 16)
+            Self::Urbdrc(..) => f.write_str("Urbdrc(..)"),
         }
     }
 }
@@ -5900,6 +5904,10 @@ impl RdpServer {
                 // (macrdp 11) macrdp's RDPDR device-I/O requests: see `macrdp::dispatch_rdpdr_drive`.
                 ServerEvent::RdpdrDrive(message) => {
                     macrdp::dispatch_rdpdr_drive(conn, writer, user_channel_id, message).await?;
+                }
+                // (macrdp 16) A `UsbHandle`'s transfer: see `macrdp::dispatch_urbdrc`.
+                ServerEvent::Urbdrc(message) => {
+                    macrdp::dispatch_urbdrc(conn, writer, user_channel_id, message).await?;
                 }
             }
         }
