@@ -80,10 +80,6 @@ pub(crate) struct MacrdpChannelFactories {
 /// capture loop (losses land in the capture ring) instead of queueing here.
 const AUDIO_CHANNEL_CAPACITY: usize = 50;
 
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "macrdp's methods stay out of server.rs so the fork's hooks there stay small"
-)]
 impl RdpServer {
     /// (macrdp) Installs macrdp's channel factories and its dedicated audio channel.
     /// Called once by the builder, right after [`Self::new`].
