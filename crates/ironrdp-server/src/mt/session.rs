@@ -18,7 +18,10 @@
 //! of it. See the divergence log's (12) for the history behind each rule.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(feature = "egfx")]
+use core::time::Duration;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Instant;
 
 use ironrdp_acceptor::{Acceptor, MultitransportSecurityRng};
 use ironrdp_dvc as dvc;
@@ -102,6 +105,8 @@ impl DynamicChannelFactory for AudioDvcFactory {
 struct PendingOffer {
     registration: Arc<StdMutex<OfferRegistration>>,
     inbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// A second sender into `inbound_rx`, for a second tunnel's registration.
+    inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 /// What a connection reads of the server's configuration, copied when the
@@ -116,6 +121,46 @@ struct MtConfig {
     migrate_egfx: bool,
     lossy_audio: bool,
     lossy_audio_format: NegotiatedAudioFormat,
+    /// Lossy audio and EGFX migration are both on: offer a second, reliable
+    /// tunnel for EGFX next to the lossy one audio uses (see [`ReliableTunnel`]).
+    second_tunnel: bool,
+}
+
+/// The second, reliable (`UdpFecR`) tunnel a connection is offered for EGFX when
+/// lossy audio already has the first (`UdpFecL`) one. A connection gets one
+/// Soft-Sync, so the request that moves lossy audio onto the lossy tunnel also
+/// moves EGFX onto this one, once it's bound; if it doesn't bind in
+/// [`SECOND_TUNNEL_BIND_TIMEOUT`], or the client refuses it, the Soft-Sync moves
+/// lossy audio alone and EGFX stays on TCP, as before.
+struct ReliableTunnel {
+    request_id: u32,
+    cookie: [u8; 16],
+    /// Raised by the listener when it binds this tunnel.
+    bound: Arc<AtomicBool>,
+    #[cfg_attr(
+        not(feature = "egfx"),
+        expect(dead_code, reason = "the second tunnel only carries EGFX")
+    )]
+    offered_at: Instant,
+    /// The client answered the request with a failure.
+    refused: bool,
+}
+
+/// How long the Soft-Sync waits for the second tunnel to bind, counted from its
+/// offer. mstsc bound it in about 300 ms on a LAN (2026-11-16 spike).
+#[cfg(feature = "egfx")]
+const SECOND_TUNNEL_BIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the Soft-Sync gate does about the second tunnel.
+#[cfg(feature = "egfx")]
+#[derive(Debug, PartialEq, Eq)]
+enum SecondTunnel {
+    /// Not wanted, refused, or not bound in time: audio alone.
+    Skip,
+    /// Offered and not bound yet: try again on the next frame.
+    Wait,
+    /// Bound: move EGFX onto it.
+    Use,
 }
 
 /// One connection's multitransport state. Its drop is the connection's teardown.
@@ -142,6 +187,15 @@ pub(in crate::server) struct MtConnection {
     /// also acknowledged it, waves stay on TCP (see
     /// [`ConnectionState::mt_route_lossy_audio`]).
     lossy_audio_soft_synced: bool,
+    /// A second sender into the tunnel inbound channel, for the second tunnel.
+    inbound_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// The first tunnel's request succeeded and a second one is wanted; sent with
+    /// the next message-channel outputs.
+    second_offer_owed: bool,
+    reliable: Option<ReliableTunnel>,
+    /// EGFX migrated onto the second (reliable) tunnel rather than the first.
+    #[cfg(feature = "egfx")]
+    egfx_on_reliable: bool,
 }
 
 impl Drop for MtConnection {
@@ -176,6 +230,13 @@ impl Drop for MtConnection {
         if let (Some(cookie), Some(registry)) = (cookie, config.cookies.as_ref()) {
             registry.remove(&cookie);
         }
+        // The second tunnel too, or the listener reads the idle one as dead.
+        if let Some(reliable) = &self.reliable {
+            reliable.bound.store(false, Ordering::Relaxed);
+            if let Some(registry) = config.cookies.as_ref() {
+                registry.remove(&reliable.cookie);
+            }
+        }
     }
 }
 
@@ -202,16 +263,31 @@ impl MtConnection {
         }
     }
 
-    /// Hand DVC messages to the listener for this connection's tunnel. The tunnel
+    /// Hand DVC messages to the listener for this connection's (first) tunnel.
+    fn route_dvc_over_udp(&self, messages: Vec<SvcMessage>) -> ServerResult<()> {
+        self.route_dvc_over_udp_on(self.migration.as_ref().map(|m| m.cookie), messages)
+    }
+
+    /// The tunnel EGFX data, and replies to what arrives over a tunnel, go on: the
+    /// second tunnel once EGFX migrated there, otherwise the first.
+    fn egfx_tunnel_cookie(&self) -> Option<[u8; 16]> {
+        #[cfg(feature = "egfx")]
+        if self.egfx_on_reliable {
+            return self.reliable.as_ref().map(|r| r.cookie);
+        }
+        self.migration.as_ref().map(|m| m.cookie)
+    }
+
+    /// Hand DVC messages to the listener for the tunnel `cookie` names. The tunnel
     /// carries the BARE DRDYNVC PDU: `RDP_TUNNEL_DATA` is the framing, so each message
     /// is encoded unframed (a `CHANNEL_PDU_HEADER` would make the client misparse the
     /// stream). Best effort: with no sender or cookie the data is dropped.
-    fn route_dvc_over_udp(&self, messages: Vec<SvcMessage>) -> ServerResult<()> {
+    fn route_dvc_over_udp_on(&self, cookie: Option<[u8; 16]>, messages: Vec<SvcMessage>) -> ServerResult<()> {
         let Some(sender) = self.config.as_ref().and_then(|c| c.tunnel_sender.as_ref()) else {
             warn!("migrated channel data but no tunnel sender; dropping");
             return Ok(());
         };
-        let Some(cookie) = self.migration.as_ref().map(|m| m.cookie) else {
+        let Some(cookie) = cookie else {
             warn!("migrated channel data but no migration cookie; dropping");
             return Ok(());
         };
@@ -290,6 +366,27 @@ fn migrate_egfx_enabled() -> bool {
 fn migrate_egfx_lossy() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
+}
+
+/// Offer the second tunnel when lossy audio and EGFX migration are both on.
+/// `MACRDP_UDP_SECOND_TUNNEL=0` turns it off (EGFX then stays on TCP, as before).
+/// Read once.
+fn second_tunnel_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MACRDP_UDP_SECOND_TUNNEL").map_or(true, |v| {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+        })
+    })
+}
+
+/// `MACRDP_UDP_MIGRATE_EGFX_LOSSY` puts EGFX on the lossy tunnel, so there is no
+/// second tunnel to offer.
+fn egfx_wants_lossy() -> bool {
+    #[cfg(feature = "egfx")]
+    return migrate_egfx_lossy();
+    #[cfg(not(feature = "egfx"))]
+    false
 }
 
 /// (macrdp 15) Link-RTT gate: a connection whose accept-time TCP RTT is at or above
@@ -433,6 +530,7 @@ impl RdpServer {
             // The listener forwards this tunnel's client-to-server data here, keyed
             // by cookie; the client loop drains the receiver.
             let (inbound, inbound_rx) = mpsc::unbounded_channel();
+            let inbound_tx = inbound.clone();
             let registration = Arc::new(StdMutex::new(OfferRegistration::default()));
             acceptor.set_multitransport_security_rng(Box::new(OfferRng {
                 registry,
@@ -442,6 +540,7 @@ impl RdpServer {
             self.macrdp.mt.pending_offer = Some(PendingOffer {
                 registration,
                 inbound_rx,
+                inbound_tx,
             });
         }
     }
@@ -461,18 +560,25 @@ impl RdpServer {
             migrate_egfx: cfg!(feature = "egfx") && (mt.migrate_egfx || migrate_egfx_enabled()),
             lossy_audio: mt.lossy_audio.is_on(),
             lossy_audio_format: mt.lossy_audio.format.clone(),
+            second_tunnel: false,
         };
-        let (offer, tunnel_inbound_rx) = match pending {
+        let config = MtConfig {
+            second_tunnel: config.lossy_audio && config.migrate_egfx && !egfx_wants_lossy() && second_tunnel_enabled(),
+            ..config
+        };
+        let (offer, tunnel_inbound_rx, inbound_tx) = match pending {
             Some(PendingOffer {
                 registration,
                 inbound_rx,
-            }) => (Some(registration), Some(inbound_rx)),
-            None => (None, None),
+                inbound_tx,
+            }) => (Some(registration), Some(inbound_rx), Some(inbound_tx)),
+            None => (None, None, None),
         };
         let mut connection = MtConnection::default();
         connection.config = Some(config);
         connection.offer = offer;
         connection.tunnel_inbound_rx = tunnel_inbound_rx;
+        connection.inbound_tx = inbound_tx;
         conn.macrdp.mt = connection;
     }
 }
@@ -527,7 +633,26 @@ impl ConnectionState {
     /// empty Soft-Sync, from [`Self::mt_with_owed_soft_sync`].
     pub(in crate::server) fn mt_on_response(&mut self, response: &MultitransportResponsePdu) {
         let has_channel_to_migrate = self.macrdp.mt.has_channel_to_migrate();
+        let wants_second_tunnel = self.macrdp.mt.config.as_ref().is_some_and(|c| c.second_tunnel);
         let mt = &mut self.macrdp.mt;
+        // The second tunnel's response: record a refusal, so the Soft-Sync stops
+        // waiting for it. Its binding is the listener's.
+        if let Some(reliable) = mt.reliable.as_mut().filter(|r| r.request_id == response.request_id) {
+            if response.is_success() {
+                debug!(
+                    request_id = response.request_id,
+                    "second (reliable) tunnel accepted by the client"
+                );
+            } else {
+                reliable.refused = true;
+                info!(
+                    request_id = response.request_id,
+                    hr = format_args!("{:#010x}", response.hr_response),
+                    "client refused the second (reliable) UDP tunnel; EGFX stays on TCP"
+                );
+            }
+            return;
+        }
         let Some(state) = mt.migration.as_mut() else {
             return;
         };
@@ -561,19 +686,28 @@ impl ConnectionState {
                 request_id = response.request_id,
                 "Initiate Multitransport Response S_OK \u{2014} leaving the Soft-Sync to the migration gate"
             );
+            if wants_second_tunnel && state.protocol == RequestedProtocol::UdpFecL && mt.reliable.is_none() {
+                mt.second_offer_owed = true;
+            }
             return;
         }
         state.soft_sync_sent = true;
         mt.soft_sync_owed = true;
     }
 
-    /// Appends the empty Soft-Sync [`Self::mt_on_response`] owes, if any, to the
-    /// message-channel handler's outputs.
+    /// Appends what [`Self::mt_on_response`] owes, if any, to the message-channel
+    /// handler's outputs: the empty Soft-Sync, or the second tunnel's offer.
     pub(in crate::server) fn mt_with_owed_soft_sync(
         &mut self,
         mut outputs: Vec<ConnectionOutput>,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
     ) -> ServerResult<Vec<ConnectionOutput>> {
+        if core::mem::take(&mut self.macrdp.mt.second_offer_owed)
+            && let Some(frame) = self.mt_second_offer_frame(user_channel_id, message_channel_id)
+        {
+            outputs.push(ConnectionOutput::ResponseFrame(frame));
+        }
         if core::mem::take(&mut self.macrdp.mt.soft_sync_owed) {
             debug!("Initiate Multitransport Response S_OK \u{2014} Soft-Sync gate open");
             // Empty: EGFX migration is driven by the listener-bound gate, not this path.
@@ -584,6 +718,79 @@ impl ConnectionState {
             }
         }
         Ok(outputs)
+    }
+
+    /// The second Initiate Multitransport Request (`UdpFecR`), on the message
+    /// channel, with its own cookie registered so the listener can bind the tunnel
+    /// to this connection. Its client-to-server data joins the first tunnel's.
+    /// `None` when something it needs is missing: the Soft-Sync then moves lossy
+    /// audio alone.
+    fn mt_second_offer_frame(&mut self, user_channel_id: u16, message_channel_id: Option<u16>) -> Option<Vec<u8>> {
+        let mt = &mut self.macrdp.mt;
+        let Some(message_channel_id) = message_channel_id else {
+            debug!("no message channel; not offering a second UDP tunnel");
+            return None;
+        };
+        let registry = mt.config.as_ref().and_then(|c| c.cookies.clone())?;
+        let inbound = mt.inbound_tx.clone()?;
+        let mut cookie = [0u8; 16];
+        if let Err(error) = getrandom::getrandom(&mut cookie) {
+            warn!(%error, "system RNG failed; not offering a second UDP tunnel");
+            return None;
+        }
+        let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let bound = registry.register(cookie, inbound);
+        let frame = match crate::mt::encode_initiate_request(
+            request_id,
+            RequestedProtocol::UdpFecR,
+            cookie,
+            message_channel_id,
+            user_channel_id,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                registry.remove(&cookie);
+                warn!(%error, "could not encode the second multitransport request");
+                return None;
+            }
+        };
+        info!(
+            request_id,
+            "offering a second (reliable) UDP tunnel for EGFX, next to the lossy one for audio"
+        );
+        mt.reliable = Some(ReliableTunnel {
+            request_id,
+            cookie,
+            bound,
+            offered_at: Instant::now(),
+            refused: false,
+        });
+        Some(frame)
+    }
+
+    /// Whether the one Soft-Sync should wait for the second tunnel, move EGFX
+    /// onto it, or go ahead without it.
+    #[cfg(feature = "egfx")]
+    fn mt_second_tunnel(&self) -> SecondTunnel {
+        let mt = &self.macrdp.mt;
+        if !mt.config.as_ref().is_some_and(|c| c.second_tunnel) {
+            return SecondTunnel::Skip;
+        }
+        if mt.second_offer_owed {
+            return SecondTunnel::Wait;
+        }
+        let Some(reliable) = mt.reliable.as_ref() else {
+            return SecondTunnel::Skip;
+        };
+        if reliable.refused {
+            SecondTunnel::Skip
+        } else if reliable.bound.load(Ordering::Relaxed) {
+            SecondTunnel::Use
+        } else if reliable.offered_at.elapsed() < SECOND_TUNNEL_BIND_TIMEOUT {
+            SecondTunnel::Wait
+        } else {
+            SecondTunnel::Skip
+        }
     }
 
     /// Route an EGFX batch over the tunnel once EGFX has migrated. Returns the batch
@@ -614,7 +821,7 @@ impl ConnectionState {
             );
             return Ok(Some(messages));
         }
-        mt.route_dvc_over_udp(messages)?;
+        mt.route_dvc_over_udp_on(mt.egfx_tunnel_cookie(), messages)?;
         Ok(None)
     }
 
@@ -646,8 +853,48 @@ impl ConnectionState {
             let Some(audio_id) = self.mt_open_channel_id::<AudioLossyDvc>() else {
                 return Ok(());
             };
+            // With EGFX migration on too, the same Soft-Sync moves EGFX onto the
+            // second (reliable) tunnel once it's bound.
+            let egfx_id = match self.mt_second_tunnel() {
+                SecondTunnel::Wait => return Ok(()),
+                SecondTunnel::Skip => None,
+                SecondTunnel::Use => match self.mt_open_channel_id::<GfxDvcBridge>() {
+                    Some(id) => Some(id),
+                    None => return Ok(()),
+                },
+            };
             if !self.macrdp.mt.claim_soft_sync() {
                 return Ok(());
+            }
+            if let Some(egfx_id) = egfx_id {
+                let mt = &mut self.macrdp.mt;
+                mt.egfx_on_udp = true;
+                mt.egfx_on_reliable = true;
+                if let Some(handle) = mt.config.as_ref().and_then(|c| c.egfx_on_udp_handle.as_ref()) {
+                    handle.store(true, Ordering::Relaxed);
+                }
+                info!(
+                    audio_channel_id = audio_id,
+                    gfx_channel_id = egfx_id,
+                    "both UDP tunnels bound \u{2014} one Soft-Sync moves lossy audio onto the lossy tunnel and EGFX \
+                     onto the reliable one"
+                );
+                self.mt_send_soft_sync_lists(
+                    writer,
+                    user_channel_id,
+                    vec![
+                        (SoftSyncTunnelType::LOSSY_UDP, vec![audio_id]),
+                        (SoftSyncTunnelType::RELIABLE_UDP, vec![egfx_id]),
+                    ],
+                )
+                .await?;
+                self.macrdp.mt.lossy_audio_soft_synced = true;
+                return Ok(());
+            }
+            if self.macrdp.mt.config.as_ref().is_some_and(|c| c.second_tunnel) {
+                info!(
+                    "second (reliable) UDP tunnel not available \u{2014} moving lossy audio alone; EGFX stays on TCP"
+                );
             }
             debug!(
                 audio_channel_id = audio_id,
@@ -722,7 +969,18 @@ impl ConnectionState {
         tunnel: SoftSyncTunnelType,
         channel_ids: Vec<u32>,
     ) -> ServerResult<()> {
-        let Some(data) = self.mt_soft_sync_frame(user_channel_id, tunnel, channel_ids)? else {
+        self.mt_send_soft_sync_lists(writer, user_channel_id, vec![(tunnel, channel_ids)])
+            .await
+    }
+
+    #[cfg(feature = "egfx")]
+    async fn mt_send_soft_sync_lists(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+        lists: Vec<(SoftSyncTunnelType, Vec<u32>)>,
+    ) -> ServerResult<()> {
+        let Some(data) = self.mt_soft_sync_lists_frame(user_channel_id, lists)? else {
             return Ok(());
         };
         writer
@@ -741,6 +999,15 @@ impl ConnectionState {
         tunnel: SoftSyncTunnelType,
         channel_ids: Vec<u32>,
     ) -> ServerResult<Option<Vec<u8>>> {
+        self.mt_soft_sync_lists_frame(user_channel_id, vec![(tunnel, channel_ids)])
+    }
+
+    /// [`Self::mt_soft_sync_frame`] with one channel list per tunnel.
+    fn mt_soft_sync_lists_frame(
+        &mut self,
+        user_channel_id: u16,
+        lists: Vec<(SoftSyncTunnelType, Vec<u32>)>,
+    ) -> ServerResult<Option<Vec<u8>>> {
         let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
             warn!("No DRDYNVC channel; cannot send Soft-Sync request");
             return Ok(None);
@@ -748,8 +1015,9 @@ impl ConnectionState {
         let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
             return Ok(None);
         };
-        let migrating = !channel_ids.is_empty();
-        let message = match drdynvc.request_soft_sync(tunnel, channel_ids) {
+        let migrating = lists.iter().any(|(_, ids)| !ids.is_empty());
+        let tunnels: Vec<&str> = lists.iter().map(|(tunnel, _)| tunnel_name(*tunnel)).collect();
+        let message = match drdynvc.request_soft_sync_lists(lists) {
             Ok(message) => message,
             Err(error) => {
                 warn!(%error, "Soft-Sync request refused; staying on TCP");
@@ -760,12 +1028,12 @@ impl ConnectionState {
             .map_err(ServerError::encode)?;
         if migrating {
             debug!(
-                tunnel = tunnel_name(tunnel),
+                ?tunnels,
                 "Sent DYNVC_SOFT_SYNC_REQUEST (migrating channels onto the UDP tunnel)"
             );
         } else {
             debug!(
-                tunnel = tunnel_name(tunnel),
+                ?tunnels,
                 "Sent DYNVC_SOFT_SYNC_REQUEST (empty channel list \u{2014} nothing migrated, stays on TCP)"
             );
         }
@@ -838,7 +1106,10 @@ impl ConnectionState {
         match drdynvc.process(pdu) {
             Ok(replies) => {
                 if !replies.is_empty()
-                    && let Err(error) = self.macrdp.mt.route_dvc_over_udp(replies)
+                    && let Err(error) = self
+                        .macrdp
+                        .mt
+                        .route_dvc_over_udp_on(self.macrdp.mt.egfx_tunnel_cookie(), replies)
                 {
                     warn!(%error, "failed to ship tunnel reply PDUs");
                 }
@@ -926,6 +1197,7 @@ mod tests {
             migrate_egfx,
             lossy_audio,
             lossy_audio_format: NegotiatedAudioFormat::new(),
+            second_tunnel: false,
         }
     }
 
@@ -974,18 +1246,18 @@ mod tests {
         let mut conn = connection(config(false, false), dvc::DrdynvcServer::new());
 
         conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
-        let outputs = conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID).unwrap();
+        let outputs = conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, None).unwrap();
         assert_eq!(frames(&outputs), vec![soft_sync_request_frame(Vec::new()).as_slice()]);
 
         // Owed once: the next message-channel PDU and a repeated response add nothing.
         assert!(
-            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID)
+            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, None)
                 .unwrap()
                 .is_empty()
         );
         conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
         assert!(
-            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID)
+            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, None)
                 .unwrap()
                 .is_empty()
         );
@@ -1024,7 +1296,7 @@ mod tests {
             let mut conn = connection(config(lossy_audio, migrate_egfx), dvc::DrdynvcServer::new());
             conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
             assert!(
-                conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID)
+                conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, None)
                     .unwrap()
                     .is_empty()
             );
@@ -1043,7 +1315,7 @@ mod tests {
         conn.mt_on_response(&MultitransportResponsePdu::abort(REQUEST_ID));
         assert!(conn.macrdp.mt.migration.is_none());
         assert!(
-            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID)
+            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, None)
                 .unwrap()
                 .is_empty()
         );
@@ -1158,6 +1430,247 @@ mod tests {
 
         assert!(handles.iter().all(|h| !h.load(Ordering::Relaxed)));
         assert!(!tunnel_bound.load(Ordering::Relaxed));
+        assert!(registry.take(&cookie).is_none(), "the cookie was evicted");
+    }
+
+    // ---- The second (reliable) tunnel ----
+
+    const MESSAGE_CHANNEL_ID: u16 = 1008;
+
+    fn two_tunnel_config(registry: &CookieRegistry) -> MtConfig {
+        let mut config = config(true, true);
+        config.second_tunnel = true;
+        config.cookies = Some(registry.clone());
+        config
+    }
+
+    /// The Initiate Multitransport Request in an owed-outputs frame.
+    fn initiate_request(frame: &[u8]) -> (u16, ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu) {
+        let ironrdp_pdu::x224::X224(indication) =
+            ironrdp_core::decode::<ironrdp_pdu::x224::X224<ironrdp_pdu::mcs::SendDataIndication<'_>>>(frame).unwrap();
+        let request = ironrdp_core::decode(indication.user_data.as_ref()).unwrap();
+        (indication.channel_id, request)
+    }
+
+    #[test]
+    fn a_lossy_audio_response_offers_the_second_tunnel_when_egfx_migrates_too() {
+        let registry = CookieRegistry::new();
+        let mut conn = connection(two_tunnel_config(&registry), dvc::DrdynvcServer::new());
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        conn.macrdp.mt.inbound_tx = Some(inbound_tx);
+
+        conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
+        let outputs = conn
+            .mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, Some(MESSAGE_CHANNEL_ID))
+            .unwrap();
+        let frames = frames(&outputs);
+        assert_eq!(frames.len(), 1, "the second offer, and no Soft-Sync yet");
+        let (channel_id, request) = initiate_request(frames[0]);
+        let reliable = conn.macrdp.mt.reliable.as_ref().unwrap();
+        assert_eq!(channel_id, MESSAGE_CHANNEL_ID);
+        assert_eq!(request.requested_protocol, RequestedProtocol::UdpFecR);
+        assert_eq!(request.request_id, reliable.request_id);
+        assert_eq!(request.security_cookie, reliable.cookie);
+        assert_ne!(reliable.cookie, COOKIE);
+
+        // The cookie binds the tunnel to this connection, and its data joins the
+        // first tunnel's.
+        let (sender, bound) = registry.take(&reliable.cookie).unwrap();
+        assert!(bound.load(Ordering::Relaxed) && reliable.bound.load(Ordering::Relaxed));
+        sender.send(vec![1]).unwrap();
+        assert_eq!(inbound_rx.try_recv().unwrap(), vec![1]);
+
+        // Offered once.
+        conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
+        assert!(
+            conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, Some(MESSAGE_CHANNEL_ID))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_second_tunnel_without_both_migrations_a_lossy_first_tunnel_or_a_message_channel() {
+        let registry = CookieRegistry::new();
+        let offer = |config: MtConfig, protocol: RequestedProtocol, message_channel_id: Option<u16>| {
+            let mut conn = connection(config, dvc::DrdynvcServer::new());
+            conn.macrdp.mt.inbound_tx = Some(mpsc::unbounded_channel().0);
+            conn.macrdp.mt.migration.as_mut().unwrap().protocol = protocol;
+            conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
+            let outputs = conn
+                .mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, message_channel_id)
+                .unwrap();
+            (outputs.is_empty(), conn.macrdp.mt.reliable.is_none())
+        };
+        let mut audio_only = config(true, false);
+        audio_only.cookies = Some(registry.clone());
+        assert_eq!(
+            offer(audio_only, RequestedProtocol::UdpFecL, Some(MESSAGE_CHANNEL_ID)),
+            (true, true)
+        );
+        assert_eq!(
+            offer(
+                two_tunnel_config(&registry),
+                RequestedProtocol::UdpFecR,
+                Some(MESSAGE_CHANNEL_ID)
+            ),
+            (true, true),
+            "the first tunnel is already the reliable one"
+        );
+        assert_eq!(
+            offer(two_tunnel_config(&registry), RequestedProtocol::UdpFecL, None),
+            (true, true)
+        );
+    }
+
+    #[cfg(feature = "egfx")]
+    struct NoopGfx;
+
+    #[cfg(feature = "egfx")]
+    impl ironrdp_egfx::server::GraphicsPipelineHandler for NoopGfx {
+        fn capabilities_advertise(&mut self, _pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {}
+
+        fn on_ready(&mut self, _negotiated: &ironrdp_egfx::pdu::CapabilitySet) {}
+    }
+
+    /// A two-tunnel connection whose first tunnel is bound and whose second has
+    /// been offered, with the audio and EGFX channels open.
+    #[cfg(feature = "egfx")]
+    fn two_tunnel_connection(
+        registry: &CookieRegistry,
+    ) -> (
+        ConnectionState,
+        mpsc::UnboundedReceiver<TunnelOutbound>,
+        Arc<AtomicBool>,
+    ) {
+        let (tunnel_sender, tunnel_rx) = tunnel_channel();
+        let on_udp = Arc::new(AtomicBool::new(false));
+        let mut config = two_tunnel_config(registry);
+        config.tunnel_sender = Some(tunnel_sender);
+        config.egfx_on_udp_handle = Some(Arc::clone(&on_udp));
+        config.lossy_audio_format.set(0);
+        let gfx = std::sync::Mutex::new(ironrdp_egfx::server::GraphicsPipelineServer::new(Box::new(NoopGfx)));
+        let drdynvc = opened_drdynvc(
+            dvc::DrdynvcServer::new()
+                .with_dynamic_channel(AudioReliableDvc::new(
+                    audio_formats(),
+                    config.lossy_audio_format.clone(),
+                ))
+                .with_dynamic_channel(AudioLossyDvc::new())
+                .with_dynamic_channel(GfxDvcBridge::new(Arc::new(gfx))),
+        );
+        let mut conn = connection(config, drdynvc);
+        conn.macrdp.mt.inbound_tx = Some(mpsc::unbounded_channel().0);
+        conn.macrdp.mt.tunnel_bound = Some(Arc::new(AtomicBool::new(true)));
+        conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
+        conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, Some(MESSAGE_CHANNEL_ID))
+            .unwrap();
+        assert!(conn.macrdp.mt.reliable.is_some());
+        (conn, tunnel_rx, on_udp)
+    }
+
+    #[cfg(feature = "egfx")]
+    #[tokio::test]
+    async fn one_soft_sync_moves_audio_and_egfx_once_the_second_tunnel_binds() {
+        let registry = CookieRegistry::new();
+        let (mut conn, mut tunnel_rx, on_udp) = two_tunnel_connection(&registry);
+        let queue = Rc::new(OutboundQueue::default());
+        let mut writer = QueuedWriter::new(Rc::clone(&queue));
+
+        // The second tunnel isn't bound yet: the Soft-Sync waits.
+        conn.mt_soft_sync_on_egfx(&mut writer, USER_CHANNEL_ID).await.unwrap();
+        assert_eq!(queue.queued_bytes.get(), 0);
+
+        conn.macrdp
+            .mt
+            .reliable
+            .as_ref()
+            .unwrap()
+            .bound
+            .store(true, Ordering::Relaxed);
+        conn.mt_soft_sync_on_egfx(&mut writer, USER_CHANNEL_ID).await.unwrap();
+        let audio_id = conn.mt_open_channel_id::<AudioLossyDvc>().unwrap();
+        let gfx_id = conn.mt_open_channel_id::<GfxDvcBridge>().unwrap();
+        let soft_sync = soft_sync_request_frame(vec![
+            SoftSyncChannelList::new(SoftSyncTunnelType::LOSSY_UDP, vec![audio_id]),
+            SoftSyncChannelList::new(SoftSyncTunnelType::RELIABLE_UDP, vec![gfx_id]),
+        ]);
+        assert_eq!(queue.queued_bytes.get(), soft_sync.len());
+        assert!(on_udp.load(Ordering::Relaxed));
+
+        // EGFX goes on the second tunnel, lossy audio on the first.
+        let reliable_cookie = conn.macrdp.mt.reliable.as_ref().unwrap().cookie;
+        assert!(
+            conn.mt_route_egfx(vec![SvcMessage::from(vec![0xab; 8])])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(tunnel_rx.try_recv().unwrap().cookie, reliable_cookie);
+        conn.get_svc_processor::<dvc::DrdynvcServer>()
+            .unwrap()
+            .process(&soft_sync_response(vec![
+                SoftSyncTunnelType::LOSSY_UDP,
+                SoftSyncTunnelType::RELIABLE_UDP,
+            ]))
+            .unwrap();
+        assert_eq!(conn.mt_route_lossy_audio(vec![3], 40), None);
+        assert_eq!(tunnel_rx.try_recv().unwrap().cookie, COOKIE);
+
+        // The one Soft-Sync is spent.
+        conn.mt_soft_sync_on_egfx(&mut writer, USER_CHANNEL_ID).await.unwrap();
+        assert_eq!(queue.queued_bytes.get(), soft_sync.len());
+    }
+
+    /// Without the second tunnel (not bound in time, or refused), the Soft-Sync
+    /// moves lossy audio alone and EGFX stays on TCP, as before.
+    #[cfg(feature = "egfx")]
+    #[tokio::test]
+    async fn without_the_second_tunnel_the_soft_sync_moves_audio_alone() {
+        for refuse in [false, true] {
+            let registry = CookieRegistry::new();
+            let (mut conn, _tunnel_rx, on_udp) = two_tunnel_connection(&registry);
+            let queue = Rc::new(OutboundQueue::default());
+            let mut writer = QueuedWriter::new(Rc::clone(&queue));
+            if refuse {
+                let request_id = conn.macrdp.mt.reliable.as_ref().unwrap().request_id;
+                conn.mt_on_response(&MultitransportResponsePdu::abort(request_id));
+                assert!(conn.macrdp.mt.migration.is_some(), "the first tunnel stays");
+            } else {
+                conn.macrdp.mt.reliable.as_mut().unwrap().offered_at =
+                    Instant::now().checked_sub(SECOND_TUNNEL_BIND_TIMEOUT).unwrap();
+            }
+
+            conn.mt_soft_sync_on_egfx(&mut writer, USER_CHANNEL_ID).await.unwrap();
+            let audio_id = conn.mt_open_channel_id::<AudioLossyDvc>().unwrap();
+            let soft_sync = soft_sync_request_frame(vec![SoftSyncChannelList::new(
+                SoftSyncTunnelType::LOSSY_UDP,
+                vec![audio_id],
+            )]);
+            assert_eq!(queue.queued_bytes.get(), soft_sync.len(), "refused: {refuse}");
+            assert!(!on_udp.load(Ordering::Relaxed));
+            assert!(
+                conn.mt_route_egfx(vec![SvcMessage::from(vec![0xab; 8])])
+                    .unwrap()
+                    .is_some(),
+                "EGFX on TCP"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_the_connection_retires_the_second_tunnel() {
+        let registry = CookieRegistry::new();
+        let mut conn = connection(two_tunnel_config(&registry), dvc::DrdynvcServer::new());
+        conn.macrdp.mt.inbound_tx = Some(mpsc::unbounded_channel().0);
+        conn.mt_on_response(&MultitransportResponsePdu::success(REQUEST_ID));
+        conn.mt_with_owed_soft_sync(Vec::new(), USER_CHANNEL_ID, Some(MESSAGE_CHANNEL_ID))
+            .unwrap();
+        let reliable = conn.macrdp.mt.reliable.as_ref().unwrap();
+        let (cookie, bound) = (reliable.cookie, Arc::clone(&reliable.bound));
+        bound.store(true, Ordering::Relaxed);
+        drop(conn);
+
+        assert!(!bound.load(Ordering::Relaxed));
         assert!(registry.take(&cookie).is_none(), "the cookie was evicted");
     }
 

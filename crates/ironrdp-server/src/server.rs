@@ -2604,7 +2604,8 @@ impl ConnectionState {
                     let outputs = self.handle_message_channel_data(context.now_ms, data);
                     // (macrdp 12) The empty Soft-Sync a successful response may owe.
                     #[cfg(feature = "multitransport")]
-                    let outputs = self.mt_with_owed_soft_sync(outputs, context.user_channel_id)?;
+                    let outputs =
+                        self.mt_with_owed_soft_sync(outputs, context.user_channel_id, context.message_channel_id)?;
                     return Ok(outputs);
                 }
                 let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) else {
