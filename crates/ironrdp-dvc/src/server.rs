@@ -435,32 +435,49 @@ impl DrdynvcServer {
         tunnel_type: SoftSyncTunnelType,
         channel_ids: Vec<u32>,
     ) -> PduResult<SvcMessage> {
+        self.request_soft_sync_lists(alloc::vec![(tunnel_type, channel_ids)])
+    }
+
+    // (macrdp divergence) See vendor/ironrdp-dvc/CLAUDE.md.
+    /// Like [`Self::request_soft_sync`], with one channel list per tunnel, for a
+    /// connection that has both a lossy and a reliable tunnel (MS-RDPEDYC 2.2.5.1
+    /// allows a list per tunnel type). The client may select any of the named
+    /// tunnels in its response. A tunnel given an empty list is requested without
+    /// moving a channel onto it. Rejects a tunnel named twice, a channel named
+    /// twice, and a channel that isn't open.
+    pub fn request_soft_sync_lists(&mut self, lists: Vec<(SoftSyncTunnelType, Vec<u32>)>) -> PduResult<SvcMessage> {
         if !matches!(self.soft_sync_state, SoftSyncState::Idle) {
             return Err(pdu_other_err!("soft-sync has already been requested"));
         }
 
+        let mut tunnels = BTreeSet::new();
         let mut seen = BTreeSet::new();
-        for channel_id in &channel_ids {
-            if !self.is_channel_opened(*channel_id) {
-                return Err(pdu_other_err!(
-                    "Soft-Sync requested for a dynamic channel that is not open"
-                ));
+        for (tunnel_type, channel_ids) in &lists {
+            if !tunnels.insert(*tunnel_type) {
+                return Err(pdu_other_err!("soft-sync request names a tunnel twice"));
             }
-            if !seen.insert(*channel_id) {
-                return Err(pdu_other_err!("soft-sync channel list contains a duplicate channel ID"));
+            for channel_id in channel_ids {
+                if !self.is_channel_opened(*channel_id) {
+                    return Err(pdu_other_err!(
+                        "Soft-Sync requested for a dynamic channel that is not open"
+                    ));
+                }
+                if !seen.insert(*channel_id) {
+                    return Err(pdu_other_err!("soft-sync channel list contains a duplicate channel ID"));
+                }
             }
         }
 
-        let channel_lists = if channel_ids.is_empty() {
-            Vec::new()
-        } else {
-            alloc::vec![SoftSyncChannelList::new(tunnel_type, channel_ids)]
-        };
+        let channel_lists = lists
+            .into_iter()
+            .filter(|(_, channel_ids)| !channel_ids.is_empty())
+            .map(|(tunnel_type, channel_ids)| SoftSyncChannelList::new(tunnel_type, channel_ids))
+            .collect();
         let message = as_svc_msg_with_flag(DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
             channel_lists,
         )))?;
         self.soft_sync_state = SoftSyncState::Active {
-            requested_tunnels: BTreeSet::from([tunnel_type]),
+            requested_tunnels: tunnels,
             response_received: false,
         };
         Ok(message)
@@ -814,6 +831,82 @@ mod tests {
 
         assert!(server.soft_sync_response_received());
         assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    // (macrdp divergence) Tests for `request_soft_sync_lists`.
+
+    #[test]
+    fn a_soft_sync_can_name_two_tunnels() {
+        let mut server = DrdynvcServer::new();
+        let audio = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let video = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        let message = server
+            .request_soft_sync_lists(alloc::vec![
+                (SoftSyncTunnelType::LOSSY_UDP, alloc::vec![audio]),
+                (SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![video]),
+            ])
+            .unwrap();
+        let DrdynvcServerPdu::SoftSyncRequest(request) =
+            ironrdp_core::decode::<DrdynvcServerPdu>(&message.encode_unframed_pdu().unwrap()).unwrap()
+        else {
+            panic!("expected a Soft-Sync request");
+        };
+        assert_eq!(
+            request.channel_lists(),
+            &[
+                SoftSyncChannelList::new(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![audio]),
+                SoftSyncChannelList::new(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![video]),
+            ]
+        );
+        // Routing stays the caller's, as with `request_soft_sync`.
+        assert_eq!(server.tunnel_for_outgoing_channel(audio), None);
+
+        // The client may switch to both tunnels.
+        server
+            .process(&soft_sync_response(alloc::vec![
+                SoftSyncTunnelType::LOSSY_UDP,
+                SoftSyncTunnelType::RELIABLE_UDP,
+            ]))
+            .unwrap();
+        assert!(server.soft_sync_response_received());
+        assert!(
+            server.request_soft_sync_lists(alloc::vec![]).is_err(),
+            "one request per connection"
+        );
+    }
+
+    #[test]
+    fn a_two_tunnel_soft_sync_rejects_a_repeated_tunnel_or_channel() {
+        let mut server = DrdynvcServer::new();
+        let channel = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let other = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        assert!(
+            server
+                .request_soft_sync_lists(alloc::vec![
+                    (SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel]),
+                    (SoftSyncTunnelType::LOSSY_UDP, alloc::vec![other]),
+                ])
+                .is_err()
+        );
+        assert!(
+            server
+                .request_soft_sync_lists(alloc::vec![
+                    (SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel]),
+                    (SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![channel]),
+                ])
+                .is_err()
+        );
+        // Rejected requests leave the one Soft-Sync unspent.
+        assert!(
+            server
+                .request_soft_sync_lists(alloc::vec![
+                    (SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel]),
+                    (SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![other]),
+                ])
+                .is_ok()
+        );
     }
 
     // (macrdp divergence) Tests for `request_soft_sync`.
