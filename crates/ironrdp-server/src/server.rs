@@ -6316,7 +6316,7 @@ impl RdpServer {
         // Keep the pending accept task across select iterations and only borrow it while waiting.
         // A reactivation or disconnect drops an unfinished task's handle without aborting it.
         // Its result is then lost, and its socket can remain bound until UDP_ACCEPT_TIMEOUT.
-        loop {
+        let outcome = loop {
             let current_udp_transport = udp_transport.as_ref();
             let queued_bytes = queue.queued_bytes.get();
             // Back-pressure: a client that sends requests and does not read
@@ -6533,7 +6533,12 @@ impl RdpServer {
                 RunState::Continue => {}
                 state => break Ok(state),
             }
-        }
+        };
+        // (macrdp 12) Hand the tunnel's receiver back, so the next pass of a
+        // reactivation keeps reading what the client sends over the tunnel (data
+        // sent meanwhile waits in the channel).
+        macrdp_tunnel.restore(conn);
+        outcome
     }
 
     async fn prepare_authenticated_connection(

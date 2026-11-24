@@ -620,6 +620,11 @@ impl ConnectionState {
         self.macrdp.mt.tunnel_inbound_rx.take()
     }
 
+    /// The client loop is done with the receiver; keep it for the next pass.
+    pub(in crate::server) fn mt_restore_tunnel_inbound(&mut self, receiver: mpsc::UnboundedReceiver<Vec<u8>>) {
+        self.macrdp.mt.tunnel_inbound_rx = Some(receiver);
+    }
+
     /// The client's Initiate Multitransport Response, from the message channel.
     ///
     /// mstsc does send `S_OK` here once the offer travels on the MCS message channel
@@ -1672,6 +1677,28 @@ mod tests {
 
         assert!(!bound.load(Ordering::Relaxed));
         assert!(registry.take(&cookie).is_none(), "the cookie was evicted");
+    }
+
+    /// A deactivation-reactivation ends one pass of the client loop and starts
+    /// the next on the same connection state. The tunnel's receiver must survive
+    /// that, with what the client sent in between, or the client's data over the
+    /// tunnel (EGFX frame acks, the capabilities for the rebuilt pipeline) is lost.
+    #[tokio::test]
+    async fn the_tunnel_receiver_survives_a_pass_of_the_client_loop() {
+        let mut conn = ConnectionState::default();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        conn.macrdp.mt.tunnel_inbound_rx = Some(receiver);
+
+        let first_pass = super::super::TunnelInbound::take(&mut conn);
+        assert!(first_pass.is_open());
+        assert!(conn.macrdp.mt.tunnel_inbound_rx.is_none(), "the loop holds it");
+        first_pass.restore(&mut conn);
+
+        // Sent while no loop is running, read by the next pass.
+        sender.send(vec![7]).unwrap();
+        let mut next_pass = super::super::TunnelInbound::take(&mut conn);
+        assert!(next_pass.is_open());
+        assert_eq!(next_pass.recv().await, Some(vec![7]));
     }
 
     #[test]

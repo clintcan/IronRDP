@@ -342,8 +342,12 @@ impl<'a> AudioDispatch<'a> {
 /// tunnel (e.g. EGFX frame acks once EGFX migrated). Closed when there's no
 /// tunnel, and always without the `multitransport` feature.
 ///
-/// Taken from the connection's state when the client loop starts, so a
-/// deactivation-reactivation pass ends it, as the old fork's per-loop future did.
+/// Taken from the connection's state when the client loop starts, and handed
+/// back with [`Self::restore`] when the loop ends, so a deactivation-reactivation
+/// pass keeps reading the tunnel. Before, a reactivation (a client resize, blank
+/// recovery) dropped it, and with EGFX on the tunnel the client's frame acks and
+/// its capabilities for the rebuilt graphics pipeline were lost: the picture
+/// stayed blank (seen live with two tunnels, 2026-11-24).
 pub(super) struct TunnelInbound {
     #[cfg(feature = "multitransport")]
     receiver: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -357,6 +361,17 @@ impl TunnelInbound {
             #[cfg(feature = "multitransport")]
             receiver: conn.mt_take_tunnel_inbound(),
         }
+    }
+
+    /// Gives the receiver back to the connection's state for its next client
+    /// loop. A receiver the listener closed meanwhile (`None`) stays gone.
+    pub(super) fn restore(self, conn: &mut ConnectionState) {
+        #[cfg(feature = "multitransport")]
+        if let Some(receiver) = self.receiver {
+            conn.mt_restore_tunnel_inbound(receiver);
+        }
+        #[cfg(not(feature = "multitransport"))]
+        let _ = conn;
     }
 
     /// Whether the arm has a receiver to read.
