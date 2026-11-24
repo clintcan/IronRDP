@@ -2624,6 +2624,9 @@ impl ConnectionState {
                         messages,
                     )?);
                     outputs.extend(self.take_dvc_events());
+                    // (macrdp 12) The two-tunnel Soft-Sync, as soon as both channels are open.
+                    #[cfg(all(feature = "multitransport", feature = "egfx"))]
+                    outputs.extend(self.mt_soft_sync_after_dvc_input(context.user_channel_id)?);
                     if self
                         .get_svc_processor::<dvc::DrdynvcServer>()
                         .is_some_and(|d| d.soft_sync_response_received())

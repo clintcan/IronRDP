@@ -859,41 +859,19 @@ impl ConnectionState {
                 return Ok(());
             };
             // With EGFX migration on too, the same Soft-Sync moves EGFX onto the
-            // second (reliable) tunnel once it's bound.
-            let egfx_id = match self.mt_second_tunnel() {
-                SecondTunnel::Wait => return Ok(()),
-                SecondTunnel::Skip => None,
-                SecondTunnel::Use => match self.mt_open_channel_id::<GfxDvcBridge>() {
-                    Some(id) => Some(id),
-                    None => return Ok(()),
-                },
-            };
-            if !self.macrdp.mt.claim_soft_sync() {
+            // second (reliable) tunnel once it's bound. Usually sent already, from
+            // `mt_soft_sync_after_dvc_input`.
+            if let Some(frame) = self.mt_two_tunnel_soft_sync_frame(user_channel_id)? {
+                return writer
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| ServerError::io("write_all", e));
+            }
+            if self.mt_second_tunnel() != SecondTunnel::Skip {
+                // Offered and not bound yet, or bound with EGFX not open yet.
                 return Ok(());
             }
-            if let Some(egfx_id) = egfx_id {
-                let mt = &mut self.macrdp.mt;
-                mt.egfx_on_udp = true;
-                mt.egfx_on_reliable = true;
-                if let Some(handle) = mt.config.as_ref().and_then(|c| c.egfx_on_udp_handle.as_ref()) {
-                    handle.store(true, Ordering::Relaxed);
-                }
-                info!(
-                    audio_channel_id = audio_id,
-                    gfx_channel_id = egfx_id,
-                    "both UDP tunnels bound \u{2014} one Soft-Sync moves lossy audio onto the lossy tunnel and EGFX \
-                     onto the reliable one"
-                );
-                self.mt_send_soft_sync_lists(
-                    writer,
-                    user_channel_id,
-                    vec![
-                        (SoftSyncTunnelType::LOSSY_UDP, vec![audio_id]),
-                        (SoftSyncTunnelType::RELIABLE_UDP, vec![egfx_id]),
-                    ],
-                )
-                .await?;
-                self.macrdp.mt.lossy_audio_soft_synced = true;
+            if !self.macrdp.mt.claim_soft_sync() {
                 return Ok(());
             }
             if self.macrdp.mt.config.as_ref().is_some_and(|c| c.second_tunnel) {
@@ -958,6 +936,75 @@ impl ConnectionState {
     }
 
     /// The channel id of `T`'s DVC, once it's open.
+    /// The two-tunnel Soft-Sync, if it can go now: both tunnels bound and both the
+    /// lossy audio and the EGFX channel open. Claims the connection's one
+    /// Soft-Sync and marks EGFX as on the reliable tunnel. `None`: not yet (or not
+    /// a two-tunnel connection, or already sent).
+    #[cfg(feature = "egfx")]
+    fn mt_two_tunnel_soft_sync_frame(&mut self, user_channel_id: u16) -> ServerResult<Option<Vec<u8>>> {
+        let mt = &self.macrdp.mt;
+        if !mt.config.as_ref().is_some_and(|c| c.lossy_audio && c.second_tunnel)
+            || !mt.tunnel_is_bound()
+            || mt.migration.as_ref().is_none_or(|m| m.soft_sync_sent)
+            || self.mt_second_tunnel() != SecondTunnel::Use
+        {
+            return Ok(None);
+        }
+        let (Some(audio_id), Some(egfx_id)) = (
+            self.mt_open_channel_id::<AudioLossyDvc>(),
+            self.mt_open_channel_id::<GfxDvcBridge>(),
+        ) else {
+            return Ok(None);
+        };
+        if !self.macrdp.mt.claim_soft_sync() {
+            return Ok(None);
+        }
+        let Some(frame) = self.mt_soft_sync_lists_frame(
+            user_channel_id,
+            vec![
+                (SoftSyncTunnelType::LOSSY_UDP, vec![audio_id]),
+                (SoftSyncTunnelType::RELIABLE_UDP, vec![egfx_id]),
+            ],
+        )?
+        else {
+            return Ok(None);
+        };
+        let mt = &mut self.macrdp.mt;
+        mt.egfx_on_udp = true;
+        mt.egfx_on_reliable = true;
+        mt.lossy_audio_soft_synced = true;
+        if let Some(handle) = mt.config.as_ref().and_then(|c| c.egfx_on_udp_handle.as_ref()) {
+            handle.store(true, Ordering::Relaxed);
+        }
+        info!(
+            audio_channel_id = audio_id,
+            gfx_channel_id = egfx_id,
+            "both UDP tunnels bound \u{2014} one Soft-Sync moves lossy audio onto the lossy tunnel and EGFX onto the \
+             reliable one"
+        );
+        Ok(Some(frame))
+    }
+
+    /// After the client's dynamic-channel data: the two-tunnel Soft-Sync, as soon as
+    /// it can go. Waiting for the first EGFX batch instead stalled every two-tunnel
+    /// connect for about 4 s (mstsc, Windows 11, 2026-11-24): once both tunnels were
+    /// bound, the client sent nothing (not even its audio-format reply) and no
+    /// frame shipped until the stall ended. Sending the Soft-Sync here, when the
+    /// client's EGFX capabilities arrive, removed the stall (first frame 0.2 s after
+    /// EGFX ready, against 4.3 s). Why mstsc waits isn't known; without the second
+    /// tunnel it doesn't.
+    #[cfg(feature = "egfx")]
+    pub(in crate::server) fn mt_soft_sync_after_dvc_input(
+        &mut self,
+        user_channel_id: u16,
+    ) -> ServerResult<Vec<ConnectionOutput>> {
+        Ok(self
+            .mt_two_tunnel_soft_sync_frame(user_channel_id)?
+            .map(ConnectionOutput::ResponseFrame)
+            .into_iter()
+            .collect())
+    }
+
     fn mt_open_channel_id<T: dvc::DvcServerProcessor + 'static>(&mut self) -> Option<u32> {
         let drdynvc = self.get_svc_processor::<dvc::DrdynvcServer>()?;
         drdynvc
@@ -1624,6 +1671,63 @@ mod tests {
         // The one Soft-Sync is spent.
         conn.mt_soft_sync_on_egfx(&mut writer, USER_CHANNEL_ID).await.unwrap();
         assert_eq!(queue.queued_bytes.get(), soft_sync.len());
+    }
+
+    /// The two-tunnel Soft-Sync goes out from the client's own channel data as soon
+    /// as both tunnels are bound and both channels are open, without waiting for
+    /// an EGFX batch; once.
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn the_two_tunnel_soft_sync_goes_as_soon_as_both_channels_are_open() {
+        let registry = CookieRegistry::new();
+        let (mut conn, _tunnel_rx, on_udp) = two_tunnel_connection(&registry);
+        assert!(
+            conn.mt_soft_sync_after_dvc_input(USER_CHANNEL_ID).unwrap().is_empty(),
+            "the second tunnel isn't bound yet"
+        );
+
+        conn.macrdp
+            .mt
+            .reliable
+            .as_ref()
+            .unwrap()
+            .bound
+            .store(true, Ordering::Relaxed);
+        let outputs = conn.mt_soft_sync_after_dvc_input(USER_CHANNEL_ID).unwrap();
+        let audio_id = conn.mt_open_channel_id::<AudioLossyDvc>().unwrap();
+        let gfx_id = conn.mt_open_channel_id::<GfxDvcBridge>().unwrap();
+        let soft_sync = soft_sync_request_frame(vec![
+            SoftSyncChannelList::new(SoftSyncTunnelType::LOSSY_UDP, vec![audio_id]),
+            SoftSyncChannelList::new(SoftSyncTunnelType::RELIABLE_UDP, vec![gfx_id]),
+        ]);
+        assert_eq!(frames(&outputs), vec![soft_sync.as_slice()]);
+        assert!(on_udp.load(Ordering::Relaxed));
+        assert!(conn.macrdp.mt.lossy_audio_soft_synced);
+        assert!(
+            conn.mt_soft_sync_after_dvc_input(USER_CHANNEL_ID).unwrap().is_empty(),
+            "one Soft-Sync per connection"
+        );
+    }
+
+    /// Without the second tunnel the hook does nothing: the lossy-audio-only
+    /// Soft-Sync stays the EGFX-batch gate's, as before.
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn the_early_soft_sync_is_only_for_two_tunnels() {
+        let config = config(true, false);
+        config.lossy_audio_format.set(0);
+        let drdynvc = opened_drdynvc(
+            dvc::DrdynvcServer::new()
+                .with_dynamic_channel(AudioReliableDvc::new(
+                    audio_formats(),
+                    config.lossy_audio_format.clone(),
+                ))
+                .with_dynamic_channel(AudioLossyDvc::new()),
+        );
+        let mut conn = connection(config, drdynvc);
+        conn.macrdp.mt.tunnel_bound = Some(Arc::new(AtomicBool::new(true)));
+        assert!(conn.mt_soft_sync_after_dvc_input(USER_CHANNEL_ID).unwrap().is_empty());
+        assert!(!conn.macrdp.mt.migration.as_ref().unwrap().soft_sync_sent);
     }
 
     /// Without the second tunnel (not bound in time, or refused), the Soft-Sync
