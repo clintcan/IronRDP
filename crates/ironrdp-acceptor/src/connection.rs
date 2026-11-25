@@ -162,6 +162,12 @@ pub struct Acceptor {
     allow_unverified_credentials: bool,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
+    /// (macrdp) Adopt a multi-monitor client's layout; see
+    /// `set_honor_client_monitor_layout()`.
+    honor_client_monitor_layout: bool,
+    /// (macrdp) The client's monitors, as it sent them, when the session
+    /// adopted its layout. `None` serves one monitor spanning the desktop.
+    monitor_layout: Option<Vec<gcc::Monitor>>,
     /// UDP multitransport flags to advertise to the client and, if it
     /// reciprocates, to offer. `None` disables the feature entirely: no
     /// Server MultiTransportChannelData block is sent, and no Initiate
@@ -236,6 +242,61 @@ fn validate_desktop_size(width: u16, height: u16) -> Option<DesktopSize> {
     } else {
         None
     }
+}
+
+/// (macrdp) Most monitors a layout may have (MS-RDPBCGR 2.2.1.3.6).
+const MAX_MONITORS: usize = 16;
+
+/// (macrdp) A monitor's `(width, height)`; `right`/`bottom` are inclusive.
+fn monitor_size(m: &gcc::Monitor) -> Option<(u16, u16)> {
+    let width = m.right.checked_sub(m.left)?.checked_add(1)?;
+    let height = m.bottom.checked_sub(m.top)?.checked_add(1)?;
+    Some((u16::try_from(width).ok()?, u16::try_from(height).ok()?))
+}
+
+/// (macrdp) The monitors' bounding box: its top-left in the monitors'
+/// coordinates, and its size. `None` if it isn't a valid desktop size.
+fn monitor_bounds(monitors: &[gcc::Monitor]) -> Option<((i32, i32), DesktopSize)> {
+    let left = monitors.iter().map(|m| m.left).min()?;
+    let top = monitors.iter().map(|m| m.top).min()?;
+    let right = monitors.iter().map(|m| m.right).max()?;
+    let bottom = monitors.iter().map(|m| m.bottom).max()?;
+    let width = u16::try_from(right.checked_sub(left)?.checked_add(1)?).ok()?;
+    let height = u16::try_from(bottom.checked_sub(top)?.checked_add(1)?).ok()?;
+    Some(((left, top), validate_desktop_size(width, height)?))
+}
+
+/// (macrdp) The desktop size and monitors to adopt from a client's monitor
+/// layout, or `None` to keep the single-monitor behaviour: fewer than two or
+/// more than [`MAX_MONITORS`] monitors, not exactly one primary at (0,0), a
+/// monitor outside 200 pixels to `max`, or a bounding box outside the desktop
+/// size range. Overlapping monitors are rejected too, since a desktop pixel
+/// must belong to one monitor.
+fn adopt_monitor_layout(monitors: &[gcc::Monitor], max: DesktopSize) -> Option<(DesktopSize, Vec<gcc::Monitor>)> {
+    if !(2..=MAX_MONITORS).contains(&monitors.len()) {
+        return None;
+    }
+    let mut primaries = monitors.iter().filter(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY));
+    match (primaries.next(), primaries.next()) {
+        (Some(p), None) if p.left == 0 && p.top == 0 => {}
+        _ => return None,
+    }
+    for m in monitors {
+        let (w, h) = monitor_size(m)?;
+        if w < MIN_DESKTOP_DIM || h < MIN_DESKTOP_DIM || w > max.width || h > max.height {
+            return None;
+        }
+    }
+    let overlaps = |a: &gcc::Monitor, b: &gcc::Monitor| {
+        a.left <= b.right && b.left <= a.right && a.top <= b.bottom && b.top <= a.bottom
+    };
+    for (i, a) in monitors.iter().enumerate() {
+        if monitors.iter().skip(i + 1).any(|b| overlaps(a, b)) {
+            return None;
+        }
+    }
+    let (_, desktop) = monitor_bounds(monitors)?;
+    Some((desktop, monitors.to_vec()))
 }
 
 /// The client's `(desktopScaleFactor, deviceScaleFactor)`, or `(None, None)`
@@ -435,6 +496,12 @@ pub struct AcceptorResult {
     /// server's session and still lists one monitor spanning the desktop size,
     /// whatever the server presents.
     pub client_monitors: Vec<gcc::Monitor>,
+    /// (macrdp) The monitor layout the session adopted from the client, in the
+    /// client's coordinates (primary at (0,0), others possibly negative), when
+    /// `set_honor_client_monitor_layout()` is on and the client sent a usable
+    /// multi-monitor layout. The desktop is then the monitors' bounding box,
+    /// and the Monitor Layout PDU lists these monitors. `None` otherwise.
+    pub monitor_layout: Option<Vec<gcc::Monitor>>,
     /// Multitransport (MS-RDPEMT) capability flags announced by the client in
     /// its GCC `MultiTransportChannelData` block (section 2.2.1.3.8).
     ///
@@ -535,6 +602,8 @@ impl Acceptor {
             allow_unverified_credentials: false,
             reactivation: false,
             honor_client_desktop_size: None,
+            honor_client_monitor_layout: false,
+            monitor_layout: None,
             offer_multitransport: None,
             advertised_multitransport: None,
             sent_multitransport_request: None,
@@ -593,6 +662,19 @@ impl Acceptor {
     /// [`RdpServerDisplay`]: <https://docs.rs/ironrdp-server/latest/ironrdp_server/trait.RdpServerDisplay.html>
     pub fn set_honor_client_desktop_size(&mut self, max: Option<DesktopSize>) {
         self.honor_client_desktop_size = max;
+    }
+
+    /// (macrdp) Adopt a multi-monitor client's layout.
+    ///
+    /// With this on and [`set_honor_client_desktop_size()`](Self::set_honor_client_desktop_size)
+    /// enabled, a client that sends a usable layout of two or more monitors in
+    /// its Client Monitor Data gets a session whose desktop is the monitors'
+    /// bounding box, and a Monitor Layout PDU listing its monitors as it sent
+    /// them. The operator maximum applies to each monitor rather than to the
+    /// whole desktop. Otherwise, and for a single monitor, nothing changes.
+    /// Off by default.
+    pub fn set_honor_client_monitor_layout(&mut self, on: bool) {
+        self.honor_client_monitor_layout = on;
     }
 
     /// Selects the CredSSP authentication provider before negotiation begins.
@@ -811,6 +893,8 @@ impl Acceptor {
             allow_unverified_credentials: consumed.allow_unverified_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            honor_client_monitor_layout: consumed.honor_client_monitor_layout,
+            monitor_layout: consumed.monitor_layout,
             offer_multitransport: consumed.offer_multitransport,
             advertised_multitransport: consumed.advertised_multitransport,
             sent_multitransport_request: consumed.sent_multitransport_request,
@@ -1082,6 +1166,7 @@ impl Acceptor {
                 multitransport_response_success: self.received_multitransport_response,
                 client_early_capability_flags: self.early_capability_flags,
                 client_monitors: self.client_monitors.clone(),
+                monitor_layout: self.monitor_layout.clone(),
                 reactivation: self.reactivation,
                 credentials: self.credentials_for_result(),
                 auto_reconnect: self.received_auto_reconnect.take(),
@@ -1419,7 +1504,18 @@ impl Sequence for Acceptor {
                 // maximum first, so an untrusted client can't drive the
                 // framebuffer/encoder allocation past that ceiling. See
                 // `set_honor_client_desktop_size`.
-                if let Some(max) = self.honor_client_desktop_size {
+                // (macrdp) A usable multi-monitor layout replaces the single
+                // requested size below.
+                self.monitor_layout = None;
+                if let (true, Some(max)) = (self.honor_client_monitor_layout, self.honor_client_desktop_size) {
+                    if let Some((desktop, monitors)) = adopt_monitor_layout(&self.client_monitors, max) {
+                        debug!(?desktop, count = monitors.len(), "Adopting the client's monitor layout");
+                        self.desktop_size = desktop;
+                        set_bitmap_desktop_size(&mut self.server_capabilities, desktop);
+                        self.monitor_layout = Some(monitors);
+                    }
+                }
+                if let (None, Some(max)) = (&self.monitor_layout, self.honor_client_desktop_size) {
                     let requested_width = gcc_blocks.core.desktop_width;
                     let requested_height = gcc_blocks.core.desktop_height;
                     let clamped_width = requested_width.min(max.width);
@@ -1793,15 +1889,23 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
+                // (macrdp) The adopted layout, unless the desktop has since been
+                // resized away from its bounding box.
+                let monitors = match &self.monitor_layout {
+                    Some(layout) if monitor_bounds(layout).map(|(_, size)| size) == Some(self.desktop_size) => {
+                        layout.clone()
+                    }
+                    _ => vec![gcc::Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(self.desktop_size.width) - 1,
+                        bottom: i32::from(self.desktop_size.height) - 1,
+                        flags: gcc::MonitorFlags::PRIMARY,
+                    }],
+                };
                 let monitor_layout =
                     rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width) - 1,
-                            bottom: i32::from(self.desktop_size.height) - 1,
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
+                        monitors,
                     });
 
                 debug!(message = ?monitor_layout, "Send");
@@ -2065,6 +2169,113 @@ fn create_gcc_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (macrdp) Multi-monitor layout adoption.
+    fn mon(left: i32, top: i32, width: i32, height: i32, primary: bool) -> gcc::Monitor {
+        gcc::Monitor {
+            left,
+            top,
+            right: left + width - 1,
+            bottom: top + height - 1,
+            flags: if primary {
+                gcc::MonitorFlags::PRIMARY
+            } else {
+                gcc::MonitorFlags::empty()
+            },
+        }
+    }
+
+    const MAX: DesktopSize = DesktopSize {
+        width: 4096,
+        height: 2304,
+    };
+
+    #[test]
+    fn a_side_by_side_layout_is_adopted_with_its_bounding_box() {
+        let layout = [mon(0, 0, 3440, 1440, true), mon(3440, 0, 1920, 1080, false)];
+        let (desktop, monitors) = adopt_monitor_layout(&layout, MAX).expect("adopted");
+        assert_eq!(
+            desktop,
+            DesktopSize {
+                width: 5360,
+                height: 1440
+            }
+        );
+        assert_eq!(monitors, layout.to_vec());
+    }
+
+    #[test]
+    fn a_monitor_left_of_the_primary_keeps_its_negative_coordinates() {
+        let layout = [mon(0, 0, 1920, 1080, true), mon(-2560, -360, 2560, 1440, false)];
+        let (desktop, monitors) = adopt_monitor_layout(&layout, MAX).expect("adopted");
+        assert_eq!(
+            desktop,
+            DesktopSize {
+                width: 4480,
+                height: 1440
+            }
+        );
+        assert_eq!(monitors, layout.to_vec());
+        assert_eq!(
+            monitor_bounds(&layout),
+            Some((
+                (-2560, -360),
+                DesktopSize {
+                    width: 4480,
+                    height: 1440
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn layouts_that_cannot_be_served_keep_one_monitor() {
+        let side = mon(1920, 0, 1920, 1080, false);
+        // One monitor: today's behaviour.
+        assert_eq!(adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true)], MAX), None);
+        // No primary, two primaries, a primary away from (0,0).
+        assert_eq!(adopt_monitor_layout(&[mon(0, 0, 1920, 1080, false), side], MAX), None);
+        assert_eq!(
+            adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true), mon(1920, 0, 1920, 1080, true)], MAX),
+            None
+        );
+        assert_eq!(
+            adopt_monitor_layout(&[mon(10, 0, 1920, 1080, true), mon(1930, 0, 1920, 1080, false)], MAX),
+            None
+        );
+        // A monitor over the operator maximum, or under 200 pixels.
+        assert_eq!(
+            adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true), mon(1920, 0, 5120, 1440, false)], MAX),
+            None
+        );
+        assert_eq!(
+            adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true), mon(1920, 0, 150, 1080, false)], MAX),
+            None
+        );
+        // Overlapping monitors.
+        assert_eq!(
+            adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true), mon(1000, 0, 1920, 1080, false)], MAX),
+            None
+        );
+        // A bounding box past 8192 pixels.
+        let wide: Vec<_> = (0..3).map(|i| mon(i * 3840, 0, 3840, 2160, i == 0)).collect();
+        assert_eq!(adopt_monitor_layout(&wide, MAX), None);
+        // More than 16 monitors.
+        let many: Vec<_> = (0..17).map(|i| mon(i * 400, 0, 400, 300, i == 0)).collect();
+        assert_eq!(adopt_monitor_layout(&many, MAX), None);
+        // Inverted rectangles.
+        let inverted = gcc::Monitor {
+            left: 1920,
+            top: 0,
+            right: 0,
+            bottom: 1079,
+            flags: gcc::MonitorFlags::empty(),
+        };
+        assert_eq!(
+            adopt_monitor_layout(&[mon(0, 0, 1920, 1080, true), inverted], MAX),
+            None
+        );
+    }
 
     fn credentials(username: &str) -> Credentials {
         Credentials {
