@@ -269,6 +269,11 @@ pub struct ConnectionInfo {
     /// empty when the client sent none. It doesn't change the Monitor Layout PDU
     /// the acceptor sends, which still describes one monitor.
     pub client_monitors: Vec<ironrdp_pdu::gcc::Monitor>,
+    /// (macrdp) See [`ironrdp_acceptor::AcceptorResult::monitor_layout`]: the
+    /// client's multi-monitor layout when the session adopted it (with
+    /// [`RdpServerBuilder::with_honor_client_monitor_layout`](crate::RdpServerBuilder::with_honor_client_monitor_layout)),
+    /// in the client's coordinates. The desktop is then the monitors' bounding box.
+    pub monitor_layout: Option<Vec<ironrdp_pdu::gcc::Monitor>>,
     /// See [`ironrdp_acceptor::AcceptorResult::routing_token`].
     pub routing_token: Option<String>,
     /// The session the client asked to reconnect to in its GCC Client Cluster Data (MS-RDPBCGR 2.2.1.3.5), as a
@@ -311,6 +316,7 @@ impl ConnectionInfo {
             timezone_info: None,
             auto_reconnect: false,
             client_monitors: Vec::new(),
+            monitor_layout: None,
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
@@ -908,6 +914,10 @@ pub struct RdpServerOptions {
     /// server-provided size. Set via
     /// [`RdpServerBuilder::with_honor_client_desktop_size`](crate::RdpServerBuilder::with_honor_client_desktop_size).
     pub honor_client_desktop_size: Option<DesktopSize>,
+    /// (macrdp) Adopt a multi-monitor client's layout (needs
+    /// `honor_client_desktop_size`). Set via
+    /// [`RdpServerBuilder::with_honor_client_monitor_layout`](crate::RdpServerBuilder::with_honor_client_monitor_layout).
+    pub honor_client_monitor_layout: bool,
     /// What to do with a second connection while a session is being served.
     /// Defaults to [`ConnectionPolicy::default_for`] the selected security
     /// mode. Set via
@@ -2128,11 +2138,13 @@ impl PendingConnection {
         capabilities: Vec<CapabilitySet>,
         creds: Option<Credentials>,
         honor_client_desktop_size: Option<DesktopSize>,
+        honor_client_monitor_layout: bool,
         udp_bind_addr: Option<SocketAddr>,
         credentials_handler: ServerCredentialsHandler,
     ) -> Self {
         let mut acceptor = Acceptor::new(security.flag(), desktop_size, capabilities, creds);
         acceptor.set_honor_client_desktop_size(honor_client_desktop_size);
+        acceptor.set_honor_client_monitor_layout(honor_client_monitor_layout);
         // Multitransport requires Enhanced Security: `RdpServerSecurity::None`
         // has nothing to authenticate the sideband transport's TLS with, and
         // matches the reference client's own Enhanced-Security-only gate.
@@ -3194,6 +3206,7 @@ where
         capabilities,
         ctx.creds.clone(),
         ctx.opts.honor_client_desktop_size,
+        ctx.opts.honor_client_monitor_layout,
         ctx.opts.udp_bind_addr,
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
@@ -4325,6 +4338,7 @@ impl RdpServer {
             capabilities,
             self.creds.clone(),
             self.opts.honor_client_desktop_size,
+            self.opts.honor_client_monitor_layout,
             self.opts.udp_bind_addr,
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
@@ -6638,6 +6652,7 @@ impl RdpServer {
                     timezone_info: result.timezone_info.clone(),
                     auto_reconnect: is_auto_reconnect,
                     client_monitors: result.client_monitors,
+                    monitor_layout: result.monitor_layout,
                     routing_token: result.routing_token.clone(),
                     redirected_session_id: result
                         .client_cluster_data
@@ -8053,6 +8068,7 @@ mod preempt_tests {
                 codecs: BitmapCodecs(Vec::new()),
                 max_request_size: 8 * 1024 * 1024,
                 honor_client_desktop_size: None,
+                honor_client_monitor_layout: false,
                 connection_policy: ConnectionPolicy::Preempt,
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,

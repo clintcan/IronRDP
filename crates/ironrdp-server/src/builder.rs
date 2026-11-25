@@ -59,6 +59,7 @@ pub struct BuilderDone {
     #[cfg(feature = "usb")]
     usb_factory: Option<Box<dyn DeviceFactory>>,
     honor_client_desktop_size: Option<DesktopSize>,
+    honor_client_monitor_layout: bool,
     auto_reconnect_cookie: Option<ServerAutoReconnect>,
     auto_reconnect_on_request: bool,
     logon_notification_on_request: bool,
@@ -181,6 +182,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 #[cfg(feature = "usb")]
                 usb_factory: None,
                 honor_client_desktop_size: None,
+                honor_client_monitor_layout: false,
                 connection_policy,
                 auto_reconnect_cookie: None,
                 auto_reconnect_on_request: false,
@@ -223,6 +225,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 #[cfg(feature = "usb")]
                 usb_factory: None,
                 honor_client_desktop_size: None,
+                honor_client_monitor_layout: false,
                 connection_policy,
                 auto_reconnect_cookie: None,
                 auto_reconnect_on_request: false,
@@ -396,6 +399,18 @@ impl RdpServerBuilder<BuilderDone> {
     /// [`request_initial_size`]: crate::RdpServerDisplay::request_initial_size
     pub fn with_honor_client_desktop_size(mut self, max: Option<DesktopSize>) -> Self {
         self.state.honor_client_desktop_size = max;
+        self
+    }
+
+    /// (macrdp) Adopt a multi-monitor client's layout: with
+    /// [`with_honor_client_desktop_size`](Self::with_honor_client_desktop_size)
+    /// also set, a client that sends two or more monitors gets a desktop the
+    /// size of their bounding box and a Monitor Layout PDU listing them, and
+    /// the size maximum applies to each monitor. The adopted layout is reported
+    /// in [`ConnectionInfo::monitor_layout`](crate::ConnectionInfo::monitor_layout).
+    /// Off by default; the display handler must then serve every monitor.
+    pub fn with_honor_client_monitor_layout(mut self, on: bool) -> Self {
+        self.state.honor_client_monitor_layout = on;
         self
     }
 
@@ -600,6 +615,7 @@ impl RdpServerBuilder<BuilderDone> {
                 max_request_size: self.state.max_request_size,
                 remote_app: self.state.remote_app,
                 honor_client_desktop_size: self.state.honor_client_desktop_size,
+                honor_client_monitor_layout: self.state.honor_client_monitor_layout,
                 connection_policy: self.state.connection_policy,
                 remotefx_quant: self.state.remotefx_quant,
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
