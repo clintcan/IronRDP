@@ -95,3 +95,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync"] }
+ironrdp-str = { path = "../ironrdp-str", version = "0.2" } # (macrdp 16) ADD_DEVICE strings in the URBDRC handshake test
