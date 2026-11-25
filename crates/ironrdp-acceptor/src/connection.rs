@@ -299,6 +299,19 @@ fn adopt_monitor_layout(monitors: &[gcc::Monitor], max: DesktopSize) -> Option<(
     Some((desktop, monitors.to_vec()))
 }
 
+/// (macrdp) The layout [`Acceptor::set_monitor_layout`] keeps: `monitors` if
+/// the layout options are on and it passes the connect-time checks.
+fn reactivation_monitor_layout(
+    monitors: Option<&[gcc::Monitor]>,
+    honor_layout: bool,
+    max: Option<DesktopSize>,
+) -> Option<Vec<gcc::Monitor>> {
+    if !honor_layout {
+        return None;
+    }
+    adopt_monitor_layout(monitors?, max?).map(|(_, monitors)| monitors)
+}
+
 /// The client's `(desktopScaleFactor, deviceScaleFactor)`, or `(None, None)`
 /// when the specification says to ignore them. Each field MUST be ignored if
 /// it is out of range, if the other field is out of range, or if the other
@@ -675,6 +688,22 @@ impl Acceptor {
     /// Off by default.
     pub fn set_honor_client_monitor_layout(&mut self, on: bool) {
         self.honor_client_monitor_layout = on;
+    }
+
+    /// (macrdp) The monitor layout for a deactivation-reactivation acceptor,
+    /// when the session's layout changed mid-session (MS-RDPEDISP): the
+    /// Monitor Layout PDU of the reactivation lists these monitors instead
+    /// of the layout adopted at connect. `None`, or a layout that fails the
+    /// connect-time checks, serves one monitor spanning the desktop. Ignored
+    /// unless [`set_honor_client_monitor_layout()`](Self::set_honor_client_monitor_layout)
+    /// and [`set_honor_client_desktop_size()`](Self::set_honor_client_desktop_size)
+    /// are on.
+    pub fn set_monitor_layout(&mut self, monitors: Option<Vec<gcc::Monitor>>) {
+        self.monitor_layout = reactivation_monitor_layout(
+            monitors.as_deref(),
+            self.honor_client_monitor_layout,
+            self.honor_client_desktop_size,
+        );
     }
 
     /// Selects the CredSSP authentication provider before negotiation begins.
@@ -2226,6 +2255,21 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn a_reactivation_keeps_a_new_layout_only_when_it_can_be_served() {
+        let layout = [mon(0, 0, 1920, 1080, true), mon(1920, 0, 1280, 720, false)];
+        assert_eq!(
+            reactivation_monitor_layout(Some(&layout), true, Some(MAX)),
+            Some(layout.to_vec())
+        );
+        // A single-monitor session, the options off, a layout that fails the checks.
+        assert_eq!(reactivation_monitor_layout(None, true, Some(MAX)), None);
+        assert_eq!(reactivation_monitor_layout(Some(&layout), false, Some(MAX)), None);
+        assert_eq!(reactivation_monitor_layout(Some(&layout), true, None), None);
+        let overlapping = [mon(0, 0, 1920, 1080, true), mon(1000, 0, 1280, 720, false)];
+        assert_eq!(reactivation_monitor_layout(Some(&overlapping), true, Some(MAX)), None);
     }
 
     #[test]
