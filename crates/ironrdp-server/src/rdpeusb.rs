@@ -34,7 +34,7 @@ use anyhow::{Context as _, Result};
 use ironrdp_core::{Encode, EncodeResult, ReadCursor, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
-use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
+use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest, RimExchangeCapabilityResponse};
 use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{Raw, TsUrbSelectConfigResult, UsbdPipeType};
 use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, SharedMsgHeader};
 use ironrdp_rdpeusb::pdu::iface_manipulation::InterfaceRelease;
@@ -1234,6 +1234,23 @@ impl UrbdrcDeviceProcessor {
 
 impl_as_any!(UrbdrcDeviceProcessor);
 
+impl UrbdrcDeviceProcessor {
+    /// The per-channel capability exchange is done: advance to CHANNEL_CREATED,
+    /// exactly as the main channel does (see `start`).
+    fn per_device_caps_done(&mut self, channel_id: u32, resp: &RimExchangeCapabilityResponse) -> Vec<DvcMessage> {
+        info!(
+            channel_id,
+            result = format_args!("{:#010x}", resp.result),
+            "URBDRC per-device capability response \u{2014} sending CHANNEL_CREATED"
+        );
+        let created = ChannelCreated {
+            msg_id: self.take_msg_id(),
+            direction: Direction::ToClient,
+        };
+        vec![dvc_msg(UrbdrcServerDevicePdu::ChanCreated(created))]
+    }
+}
+
 impl DvcProcessor for UrbdrcDeviceProcessor {
     fn channel_name(&self) -> &str {
         URBDRC_CHANNEL_NAME
@@ -1284,6 +1301,14 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     "URBDRC per-device handshake complete \u{2014} sending RIMCALL_RELEASE for ADD_DEVICE"
                 );
                 return Ok(vec![rimcall_release(self.take_msg_id())]);
+            }
+            Ok(UrbdrcClientDevicePdu::Caps(resp)) => {
+                // (macrdp 16) The per-channel capability response. Since the
+                // 79e763a0 rebase the DEVICE set decodes it too (it used to fail
+                // here and reach the CONTROL fallback below); unhandled, the
+                // per-device handshake stalled and mstsc never sent ADD_DEVICE
+                // (live 2026-11-25, v0.10.10/v0.11.x).
+                return Ok(self.per_device_caps_done(channel_id, &resp));
             }
             Ok(UrbdrcClientDevicePdu::AddDev(dev)) => {
                 info!(
@@ -1352,18 +1377,7 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                 // an error, so the per-device handshake completes on mstsc.
                 match decode::<UrbdrcClientControlPdu>(payload) {
                     Ok(UrbdrcClientControlPdu::Caps(resp)) => {
-                        // Per-channel capability exchange done — advance to CHANNEL_CREATED,
-                        // exactly as the main channel does (see `start`).
-                        info!(
-                            channel_id,
-                            result = format_args!("{:#010x}", resp.result),
-                            "URBDRC per-device capability response \u{2014} sending CHANNEL_CREATED"
-                        );
-                        let created = ChannelCreated {
-                            msg_id: self.take_msg_id(),
-                            direction: Direction::ToClient,
-                        };
-                        return Ok(vec![dvc_msg(UrbdrcServerDevicePdu::ChanCreated(created))]);
+                        return Ok(self.per_device_caps_done(channel_id, &resp));
                     }
                     _ if peek_function_id(payload) == Some(FunctionId::ADD_DEVICE) => {
                         // The device IS being announced — decode only stumbled on the body
@@ -1468,6 +1482,31 @@ mod tests {
             output_buffer_size: 0,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_device_channel_answers_the_capability_response_with_channel_created() {
+        // mstsc's capability response on a per-device channel decodes in the
+        // DEVICE set since the 79e763a0 rebase; it must still advance the
+        // handshake, or the client never announces the device.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut device = UrbdrcDeviceProcessor::new(tx, None);
+        let resp = encode_vec(&RimExchangeCapabilityResponse {
+            msg_id: 0,
+            capability: Capability::RimCapabilityVersion01,
+            result: 0,
+        })
+        .unwrap();
+        let out = device.process(8, &resp).unwrap();
+        assert_eq!(out.len(), 1);
+        let bytes = encode_vec(out[0].as_ref()).unwrap();
+        assert!(
+            matches!(
+                decode::<UrbdrcServerDevicePdu>(&bytes),
+                Ok(UrbdrcServerDevicePdu::ChanCreated(_))
+            ),
+            "expected CHANNEL_CREATED"
+        );
     }
 
     #[test]
