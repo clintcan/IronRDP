@@ -3703,6 +3703,7 @@ dependencies = [
  "ironrdp-rdpeudp-tokio",
  "ironrdp-rdpeusb",
  "ironrdp-rdpsnd",
+ "ironrdp-str",
  "ironrdp-svc",
  "ironrdp-tokio",
  "ironrdp-usb",

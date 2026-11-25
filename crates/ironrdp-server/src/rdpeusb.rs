@@ -1484,6 +1484,89 @@ mod tests {
         .unwrap()
     }
 
+    /// The client's side of a per-device channel, in order, as mstsc sends it.
+    fn client_caps_response() -> Vec<u8> {
+        encode_vec(&RimExchangeCapabilityResponse {
+            msg_id: 0,
+            capability: Capability::RimCapabilityVersion01,
+            result: 0,
+        })
+        .unwrap()
+    }
+
+    fn client_channel_created() -> Vec<u8> {
+        encode_vec(&ChannelCreated {
+            msg_id: 1,
+            direction: Direction::ToServer,
+        })
+        .unwrap()
+    }
+
+    fn client_add_device() -> Vec<u8> {
+        use ironrdp_rdpeusb::pdu::sink::{
+            AddDevice, DeviceSpeed, NoAckIsochWriteJitterBufSizeInMs, SupportedUsbVer, UsbBusIfaceVer, UsbDeviceCaps,
+            UsbdiVer,
+        };
+        use ironrdp_str::prefixed::Cch32String;
+        encode_vec(&AddDevice {
+            msg_id: 2,
+            usb_device: InterfaceId::try_from(0x100).unwrap(),
+            device_instance_id: Cch32String::new("USB\\VID_045E&PID_0B12\\TEST"),
+            hw_ids: None,
+            compat_ids: None,
+            container_id: Cch32String::new("{00000000-0000-0000-0000-000000000000}"),
+            usb_device_caps: UsbDeviceCaps {
+                usb_bus_iface_ver: UsbBusIfaceVer::V2,
+                usbdi_ver: UsbdiVer::V0X600,
+                supported_usb_ver: SupportedUsbVer::USB_20,
+                device_speed: DeviceSpeed::HIGH_SPEED,
+                no_ack_isoch_write_jitter_buf_size: NoAckIsochWriteJitterBufSizeInMs::try_from(0).unwrap(),
+            },
+        })
+        .unwrap()
+    }
+
+    /// The one server PDU a step answers with, decoded.
+    fn only_reply(out: Vec<DvcMessage>) -> UrbdrcServerDevicePdu {
+        assert_eq!(out.len(), 1, "expected exactly one reply");
+        let bytes = encode_vec(out[0].as_ref()).unwrap();
+        decode::<UrbdrcServerDevicePdu>(&bytes).expect("the reply decodes as a server device PDU")
+    }
+
+    #[test]
+    fn the_per_device_handshake_reaches_the_presenting_side() {
+        // The whole per-device handshake, as mstsc drives it: the server's
+        // capability request, the client's response, CHANNEL_CREATED both ways,
+        // RIMCALL_RELEASE, then ADD_DEVICE handed to the presenting side. A
+        // decoder change in any step (the 79e763a0 rebase broke the second)
+        // stops the device here instead of in a live session.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let presented = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&presented);
+        let callback: UsbDeviceCallback = Arc::new(move |_handle| {
+            seen.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        });
+        let mut device = UrbdrcDeviceProcessor::new(tx, Some(callback));
+
+        let start = device.start(8).unwrap();
+        assert_eq!(start.len(), 1, "start sends the capability request");
+
+        assert!(matches!(
+            only_reply(device.process(8, &client_caps_response()).unwrap()),
+            UrbdrcServerDevicePdu::ChanCreated(_)
+        ));
+        assert!(matches!(
+            only_reply(device.process(8, &client_channel_created()).unwrap()),
+            UrbdrcServerDevicePdu::IfaceRelease(_)
+        ));
+        assert!(device.process(8, &client_add_device()).unwrap().is_empty());
+        assert_eq!(presented.load(core::sync::atomic::Ordering::SeqCst), 1);
+
+        // A repeated announcement on the same channel isn't presented twice.
+        device.process(8, &client_add_device()).unwrap();
+        assert_eq!(presented.load(core::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_device_channel_answers_the_capability_response_with_channel_created() {
         // mstsc's capability response on a per-device channel decodes in the
@@ -1562,6 +1645,53 @@ mod tests {
         let processor = build(9);
         assert_eq!(processor.channel_name(), URBDRC_CHANNEL_NAME);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_device_announced_on_the_main_channel_reaches_the_presenting_side() {
+        // The whole chain: the main channel's own handshake, the client's
+        // ADD_VIRTUAL_CHANNEL, and the per-device channel the server opens for
+        // it, through its handshake to the presenting side.
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let presented = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&presented);
+        let cb: UsbDeviceCallback = Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut server = UrbdrcServer::with_sender(Some(sender)).with_device_callback(Some(cb));
+
+        assert_eq!(
+            server.start(6).unwrap().len(),
+            1,
+            "the main channel's capability request"
+        );
+        assert_eq!(
+            server.process(6, &client_caps_response()).unwrap().len(),
+            1,
+            "CHANNEL_CREATED after the capability response"
+        );
+        assert_eq!(
+            server.process(6, &client_channel_created()).unwrap().len(),
+            1,
+            "RIMCALL_RELEASE after CHANNEL_CREATED"
+        );
+
+        server.process(6, &add_virtual_channel(3)).unwrap();
+        let Ok(ServerEvent::CreateDynamicChannel(build)) = receiver.try_recv() else {
+            panic!("expected a CreateDynamicChannel event");
+        };
+        let mut device = build(8);
+        assert_eq!(device.start(8).unwrap().len(), 1);
+        assert!(matches!(
+            only_reply(device.process(8, &client_caps_response()).unwrap()),
+            UrbdrcServerDevicePdu::ChanCreated(_)
+        ));
+        assert!(matches!(
+            only_reply(device.process(8, &client_channel_created()).unwrap()),
+            UrbdrcServerDevicePdu::IfaceRelease(_)
+        ));
+        device.process(8, &client_add_device()).unwrap();
+        assert_eq!(presented.load(Ordering::Relaxed), 1);
     }
 
     #[test]
