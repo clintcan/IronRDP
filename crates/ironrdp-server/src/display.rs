@@ -439,6 +439,17 @@ pub trait RdpServerDisplay: Send {
         1
     }
 
+    /// (macrdp) The monitor layout the display is about to serve, in the
+    /// client's coordinates, for the Monitor Layout PDU of a
+    /// Deactivation-Reactivation Sequence. Asked before each reactivation when
+    /// [`RdpServerBuilder::with_honor_client_monitor_layout`](crate::RdpServerBuilder::with_honor_client_monitor_layout)
+    /// is on, so a layout the client changed mid-session (`request_layout()`)
+    /// replaces the one adopted at connect. `None` (the default) means one
+    /// monitor spanning the desktop.
+    async fn monitor_layout(&mut self) -> Option<Vec<ironrdp_pdu::gcc::Monitor>> {
+        None
+    }
+
     /// Whether to offer the Display Control Virtual Channel (MS-RDPEDISP) on
     /// this connection.
     ///

@@ -694,6 +694,15 @@ impl RdpServerDisplay for BoundDisplaySlot {
         }
     }
 
+    // (macrdp 36)
+    async fn monitor_layout(&mut self) -> Option<Vec<ironrdp_pdu::gcc::Monitor>> {
+        if let Some(mut lease) = BoundDisplayLease::take(&self.bound) {
+            lease.display_mut().monitor_layout().await
+        } else {
+            self.default.monitor_layout().await
+        }
+    }
+
     async fn offers_display_control(&mut self) -> bool {
         if let Some(mut lease) = BoundDisplayLease::take(&self.bound) {
             lease.display_mut().offers_display_control().await
@@ -7181,6 +7190,12 @@ impl RdpServer {
                         desktop_size,
                     )
                     .map_err_kind("deactivation-reactivation acceptor", ServerErrorKind::Connector)?;
+                    // (macrdp 36) The layout the display now serves, which the
+                    // client may have changed mid-session.
+                    if self.opts.honor_client_monitor_layout {
+                        let layout = self.display.lock().await.monitor_layout().await;
+                        acceptor.set_monitor_layout(layout);
+                    }
                     framed = unsplit_tokio_framed(reader, writer);
                     continue;
                 }
