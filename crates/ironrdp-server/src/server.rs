@@ -202,9 +202,33 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// configured credential validator, so a validator that hangs is cut off here
 /// too.
 ///
+/// The X.224 leg, which is written before any of that, has its own much shorter
+/// bound: [`PRE_HANDSHAKE_TIMEOUT`].
+///
 /// `tests/server/negotiation_timeout.rs` in `ironrdp-testsuite-core` pins this
 /// value; change both together.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Upper bound on the *first* leg of negotiation: how long a peer may take to
+/// send its X.224 Connection Request once the connection is taken for service.
+///
+/// [`NEGOTIATION_TIMEOUT`] bounds the whole of negotiation, and is deliberately
+/// generous because a human may be typing a password inside the CredSSP leg.
+/// That generosity is wrong here: every RDP client writes X.224 immediately
+/// after the TCP handshake, and until it is read the connection occupies one of
+/// the accept loop's two slots — the serving connection, or (under
+/// [`ConnectionPolicy::Preempt`]) the single negotiation candidate. Two silent
+/// peers therefore hold both slots for a whole budget each, without sending a
+/// byte, and every other client waits in the listen backlog: an
+/// unauthenticated denial of service on a single-console server.
+///
+/// A few seconds covers any real client — X.224 is one small PDU written before
+/// any TLS or CredSSP work — while returning the slot quickly when a peer says
+/// nothing at all.
+///
+/// `tests/server/negotiation_timeout.rs` in `ironrdp-testsuite-core` pins this
+/// value; change both together.
+const PRE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Monotonic milliseconds since first use, for feeding the auto-detect state machine.
 ///
@@ -2233,9 +2257,22 @@ impl PendingConnection {
         let security = &security;
         let framed = TokioFramed::new(stream);
 
-        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
-            .await
-            .map_err_kind("accept_begin failed", ServerErrorKind::Connector)?;
+        let res = tokio::time::timeout(
+            PRE_HANDSHAKE_TIMEOUT,
+            ironrdp_acceptor::accept_begin(framed, &mut acceptor),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                timeout = ?PRE_HANDSHAKE_TIMEOUT,
+                "Peer did not send an X.224 Connection Request in time, dropping the connection"
+            );
+            ServerError::io(
+                "timed out waiting for the X.224 Connection Request",
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
+            )
+        })?
+        .map_err_kind("accept_begin failed", ServerErrorKind::Connector)?;
 
         match res {
             // The only thing that varies between the two modes is who performs
