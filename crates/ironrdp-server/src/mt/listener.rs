@@ -82,6 +82,18 @@ impl Default for ListenerConfig {
 /// secures the MS-RDPEMT tunnel riding that stream.
 struct Peer {
     sm: RdpeudpState,
+    /// The most a SYN-family reply to this peer is padded to: the MTU, or the
+    /// size of the SYN that opened the flow if smaller. A real client pads its
+    /// SYN to the MTU (path-MTU validation), so its SYN+ACK is unchanged; a
+    /// small SYN from a spoofed address gets a reply no larger than itself
+    /// instead of an MTU-sized one (a 62x reflection for a 20-byte SYN,
+    /// clintcan/macrdp#308).
+    syn_pad_limit: u16,
+    /// Whether the peer has sent anything after its SYN (at least the ACK of
+    /// our SYN+ACK). The server's state machine counts itself established as
+    /// soon as it answers a SYN, so this, not `sm.is_established()`, is what
+    /// tells a real client from a spoofed SYN that will never reply (#308).
+    confirmed: bool,
     /// The client's reliable application stream, reassembled in order from the
     /// SM's `delivered` output. After the handshake this carries the client's
     /// MS-RDPEMT-over-TLS bytes (its TLS ClientHello first). Kept for the
@@ -229,13 +241,13 @@ fn is_syn_family(bytes: &[u8]) -> bool {
     Datagram::peek_fec_flags(bytes).is_some_and(|f| f.contains(FecFlags::SYN))
 }
 
-/// Send every datagram the SM produced, zero-padding SYN-family packets to the
-/// MTU (MS-RDPEUDP path-MTU validation). A send error is per-datagram (UDP), so
-/// log and keep going.
-async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<Vec<u8>>, mtu: u16) {
+/// Send every datagram the SM produced, zero-padding SYN-family packets to
+/// `pad_to` (MS-RDPEUDP path-MTU validation; see [`Peer::syn_pad_limit`]). A
+/// send error is per-datagram (UDP), so log and keep going.
+async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<Vec<u8>>, pad_to: u16) {
     for mut dg in to_send {
-        if is_syn_family(&dg) && dg.len() < mtu as usize {
-            dg.resize(mtu as usize, 0);
+        if is_syn_family(&dg) && dg.len() < pad_to as usize {
+            dg.resize(pad_to as usize, 0);
         }
         if let Err(e) = socket.send_to(&dg, peer_addr).await {
             trace!(error = %e, %peer_addr, "udp send_to error");
@@ -263,7 +275,7 @@ async fn pump_peers_on_timer(
         let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
         total_retransmits += retransmits;
         if !out.to_send.is_empty() {
-            send_datagrams(socket, *addr, out.to_send, mtu).await;
+            send_datagrams(socket, *addr, out.to_send, mtu.min(peer.syn_pad_limit)).await;
         }
         if retransmits > 0 || syn_retransmit {
             debug!(peer_addr = %addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (timer)");
@@ -288,6 +300,26 @@ async fn pump_peers_on_timer(
 /// TCP-session-close → evict signal (the deferred half of M3c); until then this
 /// activity-based backstop must be generous enough not to reap an idle-but-live client.
 const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
+
+/// A peer that hasn't sent anything after its SYN ([`Peer::confirmed`]) is
+/// dropped after this long. A real client answers the SYN+ACK within a round
+/// trip; a SYN from a spoofed address never does, and would otherwise hold a
+/// peer entry for the full idle timeout and be sent a keepalive every 10 s
+/// (`DEFAULT_KEEPALIVE_MS`). Shorter than that, so it gets none (#308).
+const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
+/// The most UDP peers kept at once. While full, a SYN from a new address is
+/// ignored; existing peers are never evicted to make room, so a flood of new
+/// handshakes can't take an established tunnel down. A live session uses one
+/// or two (the reliable and the lossy flow).
+const MAX_PEERS: usize = 256;
+
+/// Whether a peer last heard from at `last_seen_ms` is past its timeout at
+/// `now_ms`; `confirmed` is [`Peer::confirmed`].
+fn peer_expired(confirmed: bool, last_seen_ms: u64, now_ms: u64) -> bool {
+    let idle = now_ms.saturating_sub(last_seen_ms);
+    idle > PEER_IDLE_TIMEOUT_MS || (!confirmed && idle > HANDSHAKE_TIMEOUT_MS)
+}
 
 /// Tunnel-death detection: a peer with a BOUND tunnel (`bound_flag` kept from
 /// the cookie bind) that has been inbound-silent past `dead_ms` has lost its
@@ -400,7 +432,7 @@ fn check_dead_tunnels(
 fn gc_idle_peers(peers: &mut HashMap<SocketAddr, Peer>, bound_addrs: &mut HashMap<[u8; 16], SocketAddr>, now_ms: u64) {
     let gone: Vec<SocketAddr> = peers
         .iter()
-        .filter(|(_, p)| now_ms.saturating_sub(p.last_seen_ms) > PEER_IDLE_TIMEOUT_MS)
+        .filter(|(_, p)| peer_expired(p.confirmed, p.last_seen_ms, now_ms))
         .map(|(addr, _)| *addr)
         .collect();
     for addr in gone {
@@ -829,6 +861,20 @@ async fn run_recv_loop(
             debug!(%peer_addr, "RDPEUDP SYN on an established peer — replacing stale peer (port reuse / reconnect)");
         }
 
+        // Only a SYN opens a flow (RDPEUDP always starts with one), and only
+        // while there's room: anything else from an unknown address is dropped
+        // without creating state or answering (#308).
+        if !peers.contains_key(&peer_addr) {
+            if !is_syn_family(data) {
+                trace!(%peer_addr, "UDP datagram from an unknown peer is not a SYN; dropping");
+                continue;
+            }
+            if peers.len() >= MAX_PEERS {
+                debug!(%peer_addr, max = MAX_PEERS, "UDP peer table full; ignoring a new SYN");
+                continue;
+            }
+        }
+        let syn_pad_limit = u16::try_from(len).unwrap_or(u16::MAX).min(cfg.mtu);
         let peer = peers.entry(peer_addr).or_insert_with(|| {
             session_counter = session_counter.wrapping_add(1);
             let initial_seq = cfg.server_isn_seed.wrapping_add(session_counter);
@@ -845,6 +891,8 @@ async fn run_recv_loop(
                 debug!(%peer_addr, "RDPEUDP lossy peer will duplicate source datagrams (MACRDP_UDP_LOSSY_AUDIO_DUP)");
             }
             Peer {
+                syn_pad_limit,
+                confirmed: false,
                 sm: RdpeudpState::new(
                     Role::Server,
                     Config {
@@ -875,6 +923,9 @@ async fn run_recv_loop(
         // still emits outbound retransmits but receives nothing, so only *inbound*
         // bumps this — its `last_seen_ms` then stops advancing and it ages out.
         peer.last_seen_ms = now_ms;
+        if !is_syn_family(data) {
+            peer.confirmed = true;
+        }
 
         // (P2.0 spike) Before anything else, sniff the raw datagram for a DTLS
         // ClientHello. This fires on a *lossy* flow regardless of whether the
@@ -902,7 +953,7 @@ async fn run_recv_loop(
         let out = peer.sm.step(now_ms, Some(data));
         let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
         bump_loss(retransmits);
-        send_datagrams(&socket, peer_addr, out.to_send, cfg.mtu).await;
+        send_datagrams(&socket, peer_addr, out.to_send, peer.syn_pad_limit).await;
         if retransmits > 0 || syn_retransmit {
             // The reliable transport recovered lost packets — the signal a
             // lossy-link soak watches. Quiet (count is 0) on a clean link.
@@ -1173,5 +1224,168 @@ async fn run_recv_loop(
                 "RDPEUDP DATA datagram delivered nothing (receive-sequence mismatch)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use tokio::net::UdpSocket;
+
+    use super::*;
+
+    /// A minimal RDPEUDP v2 SYN (SYN | SYNEX, no cookie hash, as mstsc sends),
+    /// zero-padded to `pad_to` bytes if that's longer.
+    fn syn(pad_to: usize) -> Vec<u8> {
+        let mut dg = Vec::new();
+        dg.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // snSourceAck
+        dg.extend_from_slice(&64u16.to_be_bytes()); // uReceiveWindowSize
+        dg.extend_from_slice(&(0x0001u16 | 0x1000).to_be_bytes()); // SYN | SYNEX
+        dg.extend_from_slice(&1000u32.to_be_bytes()); // snInitialSequenceNumber
+        dg.extend_from_slice(&1232u16.to_be_bytes()); // uUpStreamMtu
+        dg.extend_from_slice(&1232u16.to_be_bytes()); // uDownStreamMtu
+        dg.extend_from_slice(&0x0001u16.to_be_bytes()); // uSynExFlags: version info valid
+        dg.extend_from_slice(&0x0002u16.to_be_bytes()); // uUdpVer: version 2
+        if dg.len() < pad_to {
+            dg.resize(pad_to, 0);
+        }
+        dg
+    }
+
+    async fn listener() -> UdpMultitransportListener {
+        UdpMultitransportListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ListenerConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The reply to `datagram` sent from `client`, if one comes within 500 ms.
+    async fn reply(client: &UdpSocket, to: SocketAddr, datagram: &[u8]) -> Option<Vec<u8>> {
+        client.send_to(datagram, to).await.unwrap();
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_syn_is_never_answered_with_a_larger_datagram() {
+        let l = listener().await;
+        let mtu = usize::from(ListenerConfig::default().mtu);
+
+        // A small SYN (a spoofed-source probe) used to get an MTU-sized SYN+ACK.
+        let small = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe = syn(0);
+        let answer = reply(&small, l.local_addr(), &probe).await.expect("no SYN+ACK");
+        assert!(is_syn_family(&answer), "the answer is not a SYN+ACK");
+        assert!(
+            answer.len() <= probe.len(),
+            "a {}-byte SYN got a {}-byte SYN+ACK",
+            probe.len(),
+            answer.len()
+        );
+
+        // A real client pads its SYN to the MTU, and its SYN+ACK still is.
+        let real = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answer = reply(&real, l.local_addr(), &syn(mtu)).await.expect("no SYN+ACK");
+        assert_eq!(answer.len(), mtu, "a padded SYN must still get an MTU-sized SYN+ACK");
+    }
+
+    #[tokio::test]
+    async fn only_a_syn_opens_a_flow() {
+        let l = listener().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // An ACK-flagged header from an address with no flow: no state, no answer.
+        let mut ack = Vec::new();
+        ack.extend_from_slice(&5u32.to_be_bytes());
+        ack.extend_from_slice(&64u16.to_be_bytes());
+        ack.extend_from_slice(&0x0004u16.to_be_bytes()); // ACK
+        ack.resize(1232, 0);
+        assert!(reply(&client, l.local_addr(), &ack).await.is_none());
+        // The same address can still open a flow with a SYN.
+        assert!(reply(&client, l.local_addr(), &syn(1232)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn junk_from_many_addresses_does_not_fill_the_peer_table() {
+        let l = listener().await;
+        let mut junk = Vec::new();
+        for _ in 0..MAX_PEERS {
+            let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            c.send_to(&[0u8; 64], l.local_addr()).await.unwrap();
+            junk.push(c);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let real = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            reply(&real, l.local_addr(), &syn(1232)).await.is_some(),
+            "junk datagrams took up the peer table"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_peer_table_has_a_limit() {
+        let l = listener().await;
+        let mut clients = Vec::new();
+        for _ in 0..MAX_PEERS {
+            let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            assert!(reply(&c, l.local_addr(), &syn(64)).await.is_some());
+            clients.push(c);
+        }
+        let late = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            reply(&late, l.local_addr(), &syn(64)).await.is_none(),
+            "a SYN beyond MAX_PEERS was answered"
+        );
+        // An address already in the table is still served.
+        assert!(reply(&clients[0], l.local_addr(), &syn(64)).await.is_some());
+    }
+
+    /// A client that answers the SYN+ACK is kept and gets the idle keepalive;
+    /// one that never does (a spoofed SYN) is dropped first and gets nothing
+    /// after its SYN+ACK. Takes one keepalive interval (~10 s).
+    #[tokio::test]
+    async fn only_a_peer_that_answered_gets_keepalives() {
+        let l = listener().await;
+        let answered = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spoofed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(reply(&answered, l.local_addr(), &syn(1232)).await.is_some());
+        assert!(reply(&spoofed, l.local_addr(), &syn(1232)).await.is_some());
+        // The client's ACK of the SYN+ACK.
+        let mut ack = Vec::new();
+        ack.extend_from_slice(&0u32.to_be_bytes());
+        ack.extend_from_slice(&64u16.to_be_bytes());
+        ack.extend_from_slice(&0x0004u16.to_be_bytes()); // ACK
+        answered.send_to(&ack, l.local_addr()).await.unwrap();
+
+        let wait = Duration::from_millis(macrdp_rdpeudp::state::DEFAULT_KEEPALIVE_MS + 1_500);
+        let (mut buf_a, mut buf_b) = ([0u8; 2048], [0u8; 2048]);
+        let (kept, dropped) = tokio::join!(
+            tokio::time::timeout(wait, answered.recv_from(&mut buf_a)),
+            tokio::time::timeout(wait, spoofed.recv_from(&mut buf_b)),
+        );
+        assert!(kept.is_ok(), "a peer that answered got no keepalive");
+        assert!(dropped.is_err(), "a peer that never answered was still sent to");
+    }
+
+    #[test]
+    fn an_unconfirmed_peer_expires_before_its_first_keepalive() {
+        let t = 1_000_000;
+        assert!(!peer_expired(false, t, t + HANDSHAKE_TIMEOUT_MS));
+        assert!(peer_expired(false, t, t + HANDSHAKE_TIMEOUT_MS + 1));
+        assert!(HANDSHAKE_TIMEOUT_MS < macrdp_rdpeudp::state::DEFAULT_KEEPALIVE_MS);
+        // A confirmed peer keeps the long idle timeout (mstsc's idle
+        // keepalives are ~15 s apart).
+        assert!(!peer_expired(true, t, t + HANDSHAKE_TIMEOUT_MS + 1));
+        assert!(peer_expired(true, t, t + PEER_IDLE_TIMEOUT_MS + 1));
     }
 }
